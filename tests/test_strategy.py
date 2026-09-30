@@ -34,6 +34,8 @@ class TestStrategy(unittest.TestCase):
         config.CRASH_BTC_TRIGGER_PCT = -0.04
         config.CRASH_BTC_RECOVERY_PCT = -0.02
         config.BTC_REGIME_FILTER_PCT = -0.015
+        config.MARKET_DATA_FAIL_CLOSED = True
+        config.AUTO_FILL_EMPTY_SLOTS = False
 
     def test_execute_signals_respects_max_open_slots(self):
         """Should not open more positions than the configured basket slots."""
@@ -527,6 +529,19 @@ class TestStrategy(unittest.TestCase):
 
         self.assertTrue(strategy._crash_mode)
         self.assertEqual(trader.arm_calls, 0)
+
+    def test_market_regime_missing_data_fails_closed(self):
+        class FakeTrader:
+            def get_kline_window_change(self, symbol, interval="15m", limit=5):
+                return None
+
+        strategy = Strategy(trader=FakeTrader())
+        allowed, reason, change = strategy._market_regime_entry_decision()
+
+        self.assertFalse(allowed)
+        self.assertIsNone(change)
+        self.assertIn("fail-closed", reason)
+        self.assertEqual(strategy.last_pre_trade_decisions[-1]["decision"], "WAIT")
 
     def test_market_regime_blocks_new_entries_when_btc_is_weak(self):
         """A broad BTC slide should block fresh long entries without touching exits."""

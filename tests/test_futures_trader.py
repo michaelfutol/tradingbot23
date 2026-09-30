@@ -53,7 +53,48 @@ class TestFuturesTrader(unittest.TestCase):
         config.PRE_TRADE_MAX_LOWER_CLOSE_STREAK = 5
         config.PRE_TRADE_MAX_BELOW_SMA20_PCT = 1.5
         config.PRE_TRADE_MIN_BREAKDOWN_REBOUND_PCT = 1.0
+        config.RISK_MAX_DAILY_LOSS_USD = 0
+        config.RISK_MAX_OPEN_EXPOSURE_USD = 0
+        config.RISK_MAX_LOSS_STREAK = 0
         self.trader = FuturesTrader()
+
+    def test_core_risk_gate_blocks_after_daily_loss_limit(self):
+        config.RISK_MAX_DAILY_LOSS_USD = 5
+        with patch.object(self.trader, "get_current_price", return_value=100.0):
+            pos = self.trader.open_position("ETH", margin_usd=1000)
+        with patch.object(self.trader, "get_current_price", return_value=pos.sl_price):
+            self.trader.check_positions()
+
+        with patch.object(self.trader, "get_current_price", return_value=100.0) as price_mock:
+            blocked = self.trader.open_position("BTC", margin_usd=100)
+
+        self.assertIsNone(blocked)
+        price_mock.assert_not_called()
+
+    def test_core_risk_gate_blocks_loss_streak(self):
+        config.RISK_MAX_LOSS_STREAK = 1
+        with patch.object(self.trader, "get_current_price", return_value=100.0):
+            pos = self.trader.open_position("ETH", margin_usd=1000)
+        with patch.object(self.trader, "get_current_price", return_value=pos.sl_price):
+            self.trader.check_positions()
+
+        with patch.object(self.trader, "get_current_price", return_value=100.0) as price_mock:
+            blocked = self.trader.open_position("BTC", margin_usd=100)
+
+        self.assertIsNone(blocked)
+        price_mock.assert_not_called()
+
+    def test_core_risk_gate_caps_projected_open_exposure(self):
+        config.RISK_MAX_OPEN_EXPOSURE_USD = 2500
+        with patch.object(self.trader, "get_current_price", return_value=100.0):
+            first = self.trader.open_position("ETH", margin_usd=1000)
+        self.assertIsNotNone(first)
+
+        with patch.object(self.trader, "get_current_price", return_value=100.0) as price_mock:
+            blocked = self.trader.open_position("BTC", margin_usd=500)
+
+        self.assertIsNone(blocked)
+        price_mock.assert_not_called()
 
     def test_leverage_clamp(self):
         config.LEVERAGE = 999

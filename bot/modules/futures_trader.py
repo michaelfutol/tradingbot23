@@ -786,6 +786,54 @@ class FuturesTrader:
             pos.margin_mode = "cross"
             pos.liquidation_price = self._cross_liquidation_price(pos, open_positions)
 
+    def _core_entry_risk_decision(
+        self,
+        proposed_notional: float,
+        now: datetime | None = None,
+    ) -> tuple[bool, str]:
+        """Enforce account-level entry gates independently of GUI/headless control loops."""
+        now = now or datetime.now(timezone.utc)
+        closed = [
+            p for p in self.get_trade_history()
+            if p.status != FuturesPositionStatus.EXCLUDED
+        ]
+
+        if config.RISK_MAX_DAILY_LOSS_USD > 0:
+            daily_realized = sum(
+                p.pnl_usd
+                for p in closed
+                if p.exit_time is not None and p.exit_time.date() == now.date()
+            )
+            if daily_realized <= -config.RISK_MAX_DAILY_LOSS_USD:
+                return False, (
+                    f"daily realized P&L ${daily_realized:+.2f} reached "
+                    f"-${config.RISK_MAX_DAILY_LOSS_USD:.2f} limit"
+                )
+
+        if config.RISK_MAX_LOSS_STREAK > 0:
+            streak = 0
+            for pos in reversed(closed):
+                if pos.pnl_usd < 0:
+                    streak += 1
+                else:
+                    break
+            if streak >= config.RISK_MAX_LOSS_STREAK:
+                return False, (
+                    f"loss streak {streak} reached "
+                    f"{config.RISK_MAX_LOSS_STREAK} trade limit"
+                )
+
+        if config.RISK_MAX_OPEN_EXPOSURE_USD > 0:
+            current_exposure = sum(p.notional for p in self.get_open_positions())
+            projected_exposure = current_exposure + max(proposed_notional, 0.0)
+            if projected_exposure > config.RISK_MAX_OPEN_EXPOSURE_USD:
+                return False, (
+                    f"projected open exposure ${projected_exposure:.2f} exceeds "
+                    f"${config.RISK_MAX_OPEN_EXPOSURE_USD:.2f} limit"
+                )
+
+        return True, "core risk gates passed"
+
     def open_position(
         self, symbol: str, margin_usd: float | None = None,
         entry_price: float | None = None, entry_change_24h: float = 0.0,
@@ -851,6 +899,12 @@ class FuturesTrader:
             margin_usd = max_margin_with_entry_fee
         if margin_usd < 10:
             logger.warning("Cash too low ($%.2f) — skipping %s", margin_usd, symbol)
+            return None
+
+        proposed_notional = margin_usd * self.leverage
+        risk_allowed, risk_reason = self._core_entry_risk_decision(proposed_notional, now)
+        if not risk_allowed:
+            logger.warning("[RISK-GATE] %s blocked — %s", symbol, risk_reason)
             return None
 
         market_price = self.get_current_price(symbol)

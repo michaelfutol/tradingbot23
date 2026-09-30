@@ -178,18 +178,33 @@ class Strategy:
         if threshold is None:
             return True, "BTC regime filter disabled", None
 
+        def unavailable(reason: str) -> tuple[bool, str, float | None]:
+            allowed = not config.MARKET_DATA_FAIL_CLOSED
+            decision = "RUN" if allowed else "WAIT"
+            full_reason = f"{reason}; {'fail-open' if allowed else 'fail-closed'}"
+            self.last_pre_trade_decisions.append({
+                "symbol": "BTC",
+                "source": "market_regime",
+                "decision": decision,
+                "score": 0 if not allowed else 50,
+                "reason": full_reason,
+            })
+            if not allowed:
+                logger.warning("[MARKET-REGIME] Entries blocked | %s", full_reason)
+            return allowed, full_reason, None
+
         getter = getattr(self.trader, "get_kline_window_change", None)
         if getter is None:
-            return True, "BTC regime data unavailable", None
+            return unavailable("BTC regime data unavailable")
 
         try:
             btc_change_pct = getter("BTC", interval="15m", limit=5)
         except Exception:
             logger.debug("BTC regime check failed", exc_info=True)
-            return True, "BTC regime check failed; allowing entries", None
+            return unavailable("BTC regime check failed")
 
         if btc_change_pct is None:
-            return True, "BTC regime data unavailable; allowing entries", None
+            return unavailable("BTC regime data unavailable")
 
         threshold_pct = threshold * 100
         if btc_change_pct <= threshold_pct:
@@ -688,9 +703,10 @@ class Strategy:
                     opened = self.execute_signals(dipping)
                     summary["positions_opened"] = len(opened)
 
-                # Step 4: Fill any remaining empty slots (always invested)
-                filled = self.fill_empty_slots()
-                summary["slots_filled"] = len(filled)
+                # Step 4: Optional research behavior. Live-readiness defaults to no forced exposure.
+                if config.AUTO_FILL_EMPTY_SLOTS:
+                    filled = self.fill_empty_slots()
+                    summary["slots_filled"] = len(filled)
 
         summary["pre_trade_decisions"] = list(self.last_pre_trade_decisions)
         summary["pre_trade_checked"] = len(self.last_pre_trade_decisions)

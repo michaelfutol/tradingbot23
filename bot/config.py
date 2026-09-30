@@ -86,6 +86,10 @@ PAPER_SYMBOL_GUARD_BLOCK_LIQUIDATED = os.getenv("PAPER_SYMBOL_GUARD_BLOCK_LIQUID
 # Example: -0.015 = -1.5% over roughly 1 hour. Set to "none" to disable.
 _BTC_FILTER = os.getenv("BTC_REGIME_FILTER_PCT", "-0.015")
 BTC_REGIME_FILTER_PCT = float(_BTC_FILTER) if _BTC_FILTER and _BTC_FILTER.lower() != "none" else None
+# Live-readiness safety: if regime/price data is missing, do not open new risk.
+MARKET_DATA_FAIL_CLOSED = os.getenv("MARKET_DATA_FAIL_CLOSED", "true").lower() == "true"
+# Slot-filling remains available for research, but is no longer the default behavior.
+AUTO_FILL_EMPTY_SLOTS = os.getenv("AUTO_FILL_EMPTY_SLOTS", "false").lower() == "true"
 
 # --- Coin Selection ---
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "50"))
@@ -110,7 +114,7 @@ SETTINGS_CONFIRMED = os.getenv("SETTINGS_CONFIRMED", "false").lower() == "true"
 BOT_PROFILE = os.getenv("BOT_PROFILE", "default").strip() or "default"
 
 # --- Professional risk controls ---
-# Zero disables each limit. These are enforced by the dashboard control loop.
+# Zero disables each limit. Core trader enforcement applies in GUI and headless runs.
 RISK_MAX_DAILY_LOSS_USD = float(os.getenv("RISK_MAX_DAILY_LOSS_USD", "0"))
 RISK_MAX_OPEN_EXPOSURE_USD = float(os.getenv("RISK_MAX_OPEN_EXPOSURE_USD", "0"))
 RISK_MAX_LOSS_STREAK = int(os.getenv("RISK_MAX_LOSS_STREAK", "0"))
