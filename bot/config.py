@@ -119,6 +119,14 @@ RISK_MAX_DAILY_LOSS_USD = float(os.getenv("RISK_MAX_DAILY_LOSS_USD", "0"))
 RISK_MAX_OPEN_EXPOSURE_USD = float(os.getenv("RISK_MAX_OPEN_EXPOSURE_USD", "0"))
 RISK_MAX_LOSS_STREAK = int(os.getenv("RISK_MAX_LOSS_STREAK", "0"))
 
+# --- Automated forward-test readiness gate ---
+READINESS_MIN_TRADES = int(os.getenv("READINESS_MIN_TRADES", "30"))
+READINESS_MIN_EXPECTANCY_USD = float(os.getenv("READINESS_MIN_EXPECTANCY_USD", "0"))
+READINESS_MIN_PROFIT_FACTOR = float(os.getenv("READINESS_MIN_PROFIT_FACTOR", "1.20"))
+READINESS_MAX_DRAWDOWN_PCT = float(os.getenv("READINESS_MAX_DRAWDOWN_PCT", "10"))
+READINESS_MAX_LOSS_STREAK = int(os.getenv("READINESS_MAX_LOSS_STREAK", "4"))
+READINESS_MAX_LIQUIDATIONS = int(os.getenv("READINESS_MAX_LIQUIDATIONS", "0"))
+
 # --- P2P realism / sizing controls ---
 # Paper P2P still uses live listings, then applies these conservative buffers.
 P2P_MAX_ROUTE_PHP = float(os.getenv("P2P_MAX_ROUTE_PHP", "0"))

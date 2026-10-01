@@ -1192,6 +1192,11 @@ class FuturesTrader:
             })
         except Exception:
             logger.exception("Failed to save trade to CSV")
+        try:
+            from bot.modules.readiness import save_readiness_report
+            save_readiness_report(self)
+        except Exception:
+            logger.debug("Failed to refresh readiness report", exc_info=True)
 
     def _load_trade_history(self) -> None:
         path = _history_csv()
