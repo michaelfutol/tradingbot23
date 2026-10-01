@@ -78,7 +78,7 @@ def run_trading(force_snapshot: bool = False):
         logger.info("Forcing new monthly snapshot...")
         strategy.refresh_basket()
 
-    interval_seconds = config.CHECK_INTERVAL_HOURS * 3600
+    interval_seconds = max(1.0, config.POSITION_CHECK_MINS * 60)
 
     while _running:
         try:
@@ -95,7 +95,7 @@ def run_trading(force_snapshot: bool = False):
             logger.exception("Error in trading cycle")
 
         # Wait for next cycle
-        logger.info("Next check in %.1f hours...", config.CHECK_INTERVAL_HOURS)
+        logger.info("Next check in %.1f minutes...", config.POSITION_CHECK_MINS)
         for _ in range(int(interval_seconds)):
             if not _running:
                 break
