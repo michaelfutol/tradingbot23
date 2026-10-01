@@ -22,6 +22,7 @@ a = Analysis(
         'bot.modules.backtester',
         'bot.modules.event_ledger',
         'bot.modules.readiness',
+        'bot.modules.testnet_probe',
         'binance',
         'binance.client',
         'binance.exceptions',
