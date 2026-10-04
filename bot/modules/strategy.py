@@ -5,11 +5,13 @@ signal generation.
 """
 
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 
 from bot import config
 from bot.modules.data_fetcher import DataFetcher
 from bot.modules.futures_trader import FuturesTrader
+from bot.modules.event_ledger import append_event
 from bot.modules import telegram_notifier as tg
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ class Strategy:
         self._crash_mode: bool = False
         self.last_pre_trade_decisions: list[dict] = []
         self._paper_guard_reason_cache: dict[str, str | None] = {}
+        self._entry_analysis_cache: dict[str, dict] = {}
 
     def _rank(self, coin: dict) -> int | None:
         """Return the market-cap rank we use for the top-N guard."""
@@ -179,17 +182,19 @@ class Strategy:
             return True, "BTC regime filter disabled", None
 
         getter = getattr(self.trader, "get_kline_window_change", None)
-        if getter is None:
-            return True, "BTC regime data unavailable", None
-
         try:
-            btc_change_pct = getter("BTC", interval="15m", limit=5)
+            btc_change_pct = getter("BTC", interval="15m", limit=5) if getter else None
         except Exception:
             logger.debug("BTC regime check failed", exc_info=True)
-            return True, "BTC regime check failed; allowing entries", None
+            btc_change_pct = None
 
-        if btc_change_pct is None:
-            return True, "BTC regime data unavailable; allowing entries", None
+        if btc_change_pct is None or not math.isfinite(btc_change_pct):
+            reason = "BTC regime data unavailable; waiting for fresh closed candles"
+            self.last_pre_trade_decisions.append({
+                "symbol": "BTC", "source": "market_regime",
+                "decision": "WAIT", "score": 0, "reason": reason,
+            })
+            return False, reason, None
 
         threshold_pct = threshold * 100
         if btc_change_pct <= threshold_pct:
@@ -223,10 +228,10 @@ class Strategy:
     @staticmethod
     def _analysis_allowed(analysis) -> bool:
         if analysis is None:
-            return True
+            return False
         if isinstance(analysis, dict):
-            return bool(analysis.get("allowed", analysis.get("decision") == "RUN"))
-        return bool(getattr(analysis, "allowed", False))
+            return analysis.get("decision") == "RUN" and bool(analysis.get("allowed", True))
+        return getattr(analysis, "decision", None) == "RUN" and bool(getattr(analysis, "allowed", False))
 
     @staticmethod
     def _analysis_dict(symbol: str, source: str, analysis) -> dict:
@@ -252,25 +257,22 @@ class Strategy:
         """Run optional wave/volatility analysis before opening a futures trade."""
         if not config.PRE_TRADE_ANALYSIS_ENABLED:
             return True
-        analyzer = getattr(self.trader, "pre_trade_analysis", None)
-        if analyzer is None:
-            return True
-
         symbol = coin["symbol"]
+        if symbol in self._entry_analysis_cache:
+            return self._entry_analysis_cache[symbol]["decision"] == "RUN"
+        analyzer = getattr(self.trader, "pre_trade_analysis", None)
         try:
-            analysis = analyzer(symbol)
+            analysis = analyzer(symbol) if analyzer else None
         except Exception:
             logger.exception("Pre-trade analysis failed for %s", symbol)
-            self.last_pre_trade_decisions.append({
-                "symbol": symbol,
-                "source": source,
-                "decision": "WAIT",
-                "score": 0,
-                "reason": "pre-trade analysis error",
-            })
-            return False
+            analysis = None
 
         row = self._analysis_dict(symbol, source, analysis)
+        if not self._analysis_allowed(analysis):
+            row["decision"] = "WAIT"
+        if analysis is None:
+            row.update(score=0, reason="pre-trade analysis unavailable; waiting for valid data")
+        self._entry_analysis_cache[symbol] = row
         self.last_pre_trade_decisions.append(row)
         if not self._analysis_allowed(analysis):
             logger.info(
@@ -288,6 +290,43 @@ class Strategy:
             row.get("reason", ""),
         )
         return True
+
+    def _rank_entry_candidates(self, coins: list[dict], source: str) -> list[dict]:
+        """Analyze each eligible symbol once per cycle, then prefer quality."""
+        held = {p.symbol for p in self.trader.get_open_positions()}
+        candidates = []
+        seen = set()
+        for coin in coins:
+            symbol = coin["symbol"]
+            if symbol in held or symbol in seen:
+                continue
+            seen.add(symbol)
+            if not self._is_tradeable_symbol(symbol) or not self._is_top_ranked_coin(coin):
+                continue
+            if not self._paper_guard_allows_candidate(symbol, source):
+                continue
+            if self._pre_trade_allows_entry(coin, source):
+                candidates.append(coin)
+        # Stable tie ordering preserves the existing universe order.
+        return sorted(candidates, key=lambda c: -float(
+            self._entry_analysis_cache.get(c["symbol"], {}).get("score", 0) or 0))
+
+    def _record_entry_quality(self, position, source: str) -> None:
+        row = self._entry_analysis_cache.get(position.symbol, {})
+        try:
+            append_event(
+                domain="futures", event_type="ENTRY_QUALITY", status="RUN",
+                amount=getattr(position, "margin_used", 0.0), currency="USD",
+                pnl=0.0, balance=getattr(self.trader, "cash_balance", 0.0),
+                symbol_or_route=position.symbol,
+                details=(f"entry-quality-v1 | source {source} | score {row.get('score', 'disabled')} | "
+                         f"require_dip={config.FUTURES_REQUIRE_DIP} | "
+                         f"wave={config.PRE_TRADE_ANALYSIS_ENABLED} | "
+                         f"confirm={config.PRE_TRADE_CONFIRMATION_ENABLED} | "
+                         f"{row.get('reason', '')}"),
+            )
+        except Exception:
+            logger.exception("Could not record entry quality for %s", position.symbol)
 
     def should_refresh_basket(self, now: datetime | None = None) -> bool:
         """Check if we need a new monthly snapshot."""
@@ -465,7 +504,9 @@ class Strategy:
             List of opened positions.
         """
         opened = []
-        for coin in dipping_coins:
+        if len(self.trader.get_open_positions()) >= config.MAX_OPEN_TRADES:
+            return []
+        for coin in self._rank_entry_candidates(dipping_coins, "dip"):
             symbol = coin["symbol"]
             if not self._is_tradeable_symbol(symbol):
                 logger.warning("Skipping %s — excluded from futures universe", symbol)
@@ -501,17 +542,14 @@ class Strategy:
                 symbol, entry_price=cg_price, entry_change_24h=change_24h,
             )
             if position:
+                self._record_entry_quality(position, "dip")
                 opened.append(position)
 
         return opened
 
     def fill_empty_slots(self) -> list:
-        """Fill any open position slots with basket coins (no dip threshold required).
-
-        Ensures capital is always fully deployed. Picks the worst 24h performers
-        from the basket that aren't already held, sorted worst-first.
-        """
-        if not self.basket:
+        """Optional legacy non-dip refill, still ordered by entry quality."""
+        if config.FUTURES_REQUIRE_DIP or not self.basket:
             return []
 
         open_positions = self.trader.get_open_positions()
@@ -557,7 +595,7 @@ class Strategy:
         candidates.sort(key=lambda c: c["change_24h"])
 
         opened = []
-        for coin in candidates:
+        for coin in self._rank_entry_candidates(candidates, "fill"):
             if len(opened) >= slots:
                 break
             if not self._paper_guard_allows_candidate(coin["symbol"], "fill"):
@@ -570,6 +608,7 @@ class Strategy:
                 entry_change_24h=coin["change_24h"],
             )
             if position:
+                self._record_entry_quality(position, "fill")
                 logger.info("[FILL] Opened %s (24h: %+.2f%%) to fill empty slot",
                             coin["symbol"], coin["change_24h"])
                 opened.append(position)
@@ -647,6 +686,7 @@ class Strategy:
         }
         self.last_pre_trade_decisions = []
         self._paper_guard_reason_cache = {}
+        self._entry_analysis_cache = {}
 
         if hasattr(self.trader, "apply_monthly_contribution"):
             contributed = self.trader.apply_monthly_contribution(now)
@@ -658,14 +698,14 @@ class Strategy:
                 )
                 tg.alert_contribution(contributed, self.trader.cash_balance, now.strftime("%Y-%m"))
 
+        # Always manage existing exposure before any universe/network refresh.
+        closed = self.trader.check_positions()
+        summary["positions_closed"] = len(closed)
+
         # Step 1: Check if we need a new basket
         if self.should_refresh_basket(now):
             self.refresh_basket(now)
             summary["basket_refreshed"] = True
-
-        # Step 2: Check existing positions (TP/SL/expiry)
-        closed = self.trader.check_positions()
-        summary["positions_closed"] = len(closed)
 
         # Step 2b: Crash detection — check BTC 24h change
         self._update_crash_mode()
@@ -688,7 +728,7 @@ class Strategy:
                     opened = self.execute_signals(dipping)
                     summary["positions_opened"] = len(opened)
 
-                # Step 4: Fill any remaining empty slots (always invested)
+                # Step 4: Optional legacy refill; disabled by Require dip.
                 filled = self.fill_empty_slots()
                 summary["slots_filled"] = len(filled)
 

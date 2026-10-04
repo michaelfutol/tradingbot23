@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: tradingbot23-api
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn bot.api:app --host 0.0.0.0 --port $PORT --workers 1"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: TRADING_MODE
+        value: paper
+      - key: BOT_PROFILE
+        value: web-paper
+      - key: WEB_USERNAME
+        sync: false
+      - key: WEB_PASSWORD
+        sync: false
+      - key: DATA_DIR
+        sync: false
+      - key: WEB_ALLOWED_ORIGINS
+        value: https://trade23.futoltech.com
+      - key: WEB_ENABLE_CYCLES
+        value: "false"

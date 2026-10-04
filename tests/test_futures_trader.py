@@ -22,10 +22,13 @@ from tests.support import isolate_data_dir
 def _klines_from_closes(closes):
     rows = []
     prev = closes[0]
-    for close in closes:
+    step = 900_000
+    end = int(datetime.now(timezone.utc).timestamp() * 1000) // step * step
+    for idx, close in enumerate(closes):
         high = max(prev, close) * 1.001
         low = min(prev, close) * 0.999
-        rows.append([0, str(prev), str(high), str(low), str(close), "1000"])
+        opened = end - (len(closes) - idx) * step
+        rows.append([opened, str(prev), str(high), str(low), str(close), "1000", opened + step - 1])
         prev = close
     return rows
 
@@ -49,6 +52,7 @@ class TestFuturesTrader(unittest.TestCase):
         config.MONTHLY_CONTRIBUTION_USD = 0
         config.MONTHLY_CONTRIBUTION_DAY = 1
         config.PRE_TRADE_BREAKDOWN_GUARD_ENABLED = True
+        config.PRE_TRADE_CONFIRMATION_ENABLED = False
         config.PRE_TRADE_MAX_24H_DROP_PCT = 8.0
         config.PRE_TRADE_MAX_LOWER_CLOSE_STREAK = 5
         config.PRE_TRADE_MAX_BELOW_SMA20_PCT = 1.5
@@ -115,7 +119,7 @@ class TestFuturesTrader(unittest.TestCase):
         change = self.trader.get_kline_window_change("BTC", interval="15m", limit=5)
 
         self.assertAlmostEqual(change, -4.0)
-        self.assertEqual(fake.args, ("BTCUSDT", "15m", 5))
+        self.assertEqual(fake.args, ("BTCUSDT", "15m", 6))
 
     def test_open_rejects_excluded_stablecoin_even_with_entry_price(self):
         with patch.object(self.trader, "get_current_price", return_value=1.0) as price_mock:
@@ -400,7 +404,7 @@ class TestFuturesTrader(unittest.TestCase):
         self.assertEqual(closed[0].status, FuturesPositionStatus.TP_HIT)
         self.assertLess(closed[0].pnl_pct, 5.0)
 
-    def test_positive_liquidation_history_is_repaired_to_tp(self):
+    def test_positive_liquidation_history_is_not_rewritten(self):
         now = datetime.now(timezone.utc)
         earlier = now - timedelta(hours=1)
         row = {
@@ -433,13 +437,11 @@ class TestFuturesTrader(unittest.TestCase):
         with open(path, "r", newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
 
-        self.assertEqual(loaded.status, FuturesPositionStatus.TP_HIT)
-        self.assertEqual(rows[0]["reason"], "tp_hit")
-        self.assertLess(float(rows[0]["exit_price"]), 101.0)
-        self.assertGreater(loaded.pnl_usd, 0)
-        self.assertLess(loaded.pnl_pct, 5.0)
+        self.assertEqual(loaded.status, FuturesPositionStatus.LIQUIDATED)
+        self.assertEqual(rows[0], row)
+        self.assertEqual(loaded.pnl_usd, 395)
 
-    def test_legacy_tp_history_is_repaired_to_configured_net_target(self):
+    def test_history_is_not_rewritten_using_todays_tp(self):
         now = datetime.now(timezone.utc)
         earlier = now - timedelta(days=4)
         row = {
@@ -473,9 +475,8 @@ class TestFuturesTrader(unittest.TestCase):
             rows = list(csv.DictReader(handle))
 
         self.assertEqual(loaded.status, FuturesPositionStatus.TP_HIT)
-        self.assertGreater(loaded.pnl_usd, 0)
-        self.assertAlmostEqual(loaded.pnl_pct, config.FUTURES_NET_TP_PCT * 100, delta=0.05)
-        self.assertGreater(float(rows[0]["exit_price"]), float(row["exit_price"]))
+        self.assertEqual(loaded.pnl_usd, -0.7276)
+        self.assertEqual(rows[0], row)
 
     def test_expiry(self):
         with patch.object(self.trader, "get_current_price", return_value=100.0):

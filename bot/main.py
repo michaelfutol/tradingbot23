@@ -195,6 +195,10 @@ def main():
         "--dashboard", action="store_true",
         help="Launch the GUI dashboard instead of console mode",
     )
+    parser.add_argument(
+        "--api", action="store_true",
+        help="Launch the FastAPI web server",
+    )
 
     args = parser.parse_args()
 
@@ -214,6 +218,9 @@ def main():
         run_backtest(args.start, args.end)
     elif args.dashboard:
         run_dashboard(force_snapshot=args.force_snapshot)
+    elif args.api:
+        import uvicorn
+        uvicorn.run("bot.api:app", host="127.0.0.1", port=8000, reload=False)
     else:
         run_trading(force_snapshot=args.force_snapshot)
 

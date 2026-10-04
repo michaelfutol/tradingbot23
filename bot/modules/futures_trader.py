@@ -15,6 +15,7 @@ Modeled futures mechanics:
 import csv
 import json
 import logging
+import math
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,7 @@ from bot import config
 from bot.modules import accounting
 from bot.modules import telegram_notifier as tg
 from bot.modules.event_ledger import append_event
+from bot.modules.candle_data import closed_candles
 
 logger = logging.getLogger(__name__)
 MAINTENANCE_MARGIN_RATE = 0.005
@@ -61,9 +63,13 @@ def _reset_sessions_csv():
 
 def _append_trade_csv(row: dict) -> None:
     path = _history_csv()
-    write_header = not path.exists()
+    write_header = not path.exists() or path.stat().st_size == 0
+    fields = _CSV_HEADER
+    if not write_header:
+        with open(path, "r", newline="", encoding="utf-8") as existing:
+            fields = next(csv.reader(existing))
     with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=_CSV_HEADER)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         if write_header:
             w.writeheader()
         w.writerow(row)
@@ -353,6 +359,9 @@ class FuturesPosition:
     amount_usd: float = 0.0               # margin committed at entry
     entry_change_24h: float = 0.0         # 24h % change that triggered the buy
     margin_mode: str = "cross"
+    net_tp_pct: float | None = None
+    fee_rate: float | None = None
+    funding_rate_daily: float | None = None
 
 
 @dataclass
@@ -427,9 +436,17 @@ def analyze_pre_trade_klines(symbol: str, klines: list) -> PreTradeAnalysis:
             above_sma20_pct=0.0,
         )
 
-    closes = [float(k[4]) for k in klines if float(k[4]) > 0]
-    highs = [float(k[2]) for k in klines if float(k[2]) > 0]
-    lows = [float(k[3]) for k in klines if float(k[3]) > 0]
+    try:
+        prices = [[float(k[i]) for i in (1, 2, 3, 4)] for k in klines]
+        if any(not all(math.isfinite(v) and v > 0 for v in p)
+               or not p[2] <= min(p[0], p[3]) <= max(p[0], p[3]) <= p[1]
+               for p in prices):
+            raise ValueError("invalid OHLC")
+    except (ValueError, TypeError, IndexError):
+        return analyze_pre_trade_klines(symbol, [])
+    closes = [p[3] for p in prices]
+    highs = [p[1] for p in prices]
+    lows = [p[2] for p in prices]
     if len(closes) < 20 or not highs or not lows:
         return PreTradeAnalysis(
             symbol=symbol,
@@ -464,6 +481,12 @@ def analyze_pre_trade_klines(symbol: str, klines: list) -> PreTradeAnalysis:
     score = 50.0
     notes: list[str] = []
     blockers: list[str] = []
+
+    if config.PRE_TRADE_CONFIRMATION_ENABLED:
+        if not closes[-1] > closes[-2] > closes[-3]:
+            blockers.append("rebound confirmation: need two rising completed closes")
+        if change_1h <= 0 or above_sma20 <= 0:
+            blockers.append("rebound confirmation: need positive 1h momentum above SMA20")
 
     if rebound_from_low >= config.PRE_TRADE_MIN_REBOUND_PCT:
         score += 20
@@ -658,24 +681,17 @@ class FuturesTrader:
         interval: str = "15m",
         limit: int = 5,
     ) -> float | None:
-        """Compute close-to-close % change across a small kline window."""
+        """Compute change from fresh completed futures candles only."""
         pair = self._trading_pair(symbol)
         try:
             klines = self.client.futures_klines(
-                symbol=pair, interval=interval, limit=limit,
+                symbol=pair, interval=interval, limit=limit + 1,
             )
-        except BinanceAPIException:
-            try:
-                klines = self.client.get_klines(
-                    symbol=pair, interval=interval, limit=limit,
-                )
-            except BinanceAPIException as e:
-                logger.debug("No kline window data for %s: %s", pair, e)
-                return None
-
-        closes = [float(k[4]) for k in klines if float(k[4]) > 0]
-        if len(closes) < 2 or closes[0] <= 0:
+            klines = closed_candles(klines, interval, limit)
+        except Exception:
+            logger.debug("No valid futures kline window for %s", pair, exc_info=True)
             return None
+        closes = [float(k[4]) for k in klines]
         return ((closes[-1] - closes[0]) / closes[0]) * 100
 
     def pre_trade_analysis(self, symbol: str) -> PreTradeAnalysis:
@@ -685,36 +701,55 @@ class FuturesTrader:
             klines = self.client.futures_klines(
                 symbol=pair,
                 interval=config.PRE_TRADE_KLINE_INTERVAL,
-                limit=config.PRE_TRADE_KLINE_LIMIT,
+                limit=config.PRE_TRADE_KLINE_LIMIT + 1,
             )
-        except BinanceAPIException:
-            try:
-                klines = self.client.get_klines(
-                    symbol=pair,
-                    interval=config.PRE_TRADE_KLINE_INTERVAL,
-                    limit=config.PRE_TRADE_KLINE_LIMIT,
-                )
-            except BinanceAPIException as e:
-                logger.debug("No pre-trade kline data for %s: %s", pair, e)
-                return PreTradeAnalysis(
-                    symbol=symbol,
-                    decision="WAIT",
-                    score=0,
-                    reason=f"no Binance kline data for {pair}",
-                    current_price=0.0,
-                    change_24h_pct=0.0,
-                    change_4h_pct=0.0,
-                    change_1h_pct=0.0,
-                    rebound_from_low_pct=0.0,
-                    range_24h_pct=0.0,
-                    above_sma20_pct=0.0,
-                )
+            klines = closed_candles(klines, config.PRE_TRADE_KLINE_INTERVAL,
+                                    config.PRE_TRADE_KLINE_LIMIT)
+        except Exception as e:
+            logger.debug("No valid pre-trade futures candles for %s", pair, exc_info=True)
+            result = analyze_pre_trade_klines(symbol, [])
+            result.reason = f"fresh completed futures candles unavailable for {pair} ({type(e).__name__})"
+            return result
         return analyze_pre_trade_klines(symbol, klines)
 
     def get_portfolio_value(self) -> float:
         """Cash balance + unrealized margin value using cached prices (no UI-thread API calls)."""
         equity, _maintenance = self._account_equity_and_maintenance()
         return equity
+
+    @staticmethod
+    def estimate_position_pnl(pos: FuturesPosition, now: datetime | None = None) -> dict:
+        """Net close-at-cached-mark estimate, using the position's original costs."""
+        now = now or datetime.now(timezone.utc)
+        mark = FuturesTrader._mark_price(pos)
+        age_days = max(0.0, (now - pos.entry_time).total_seconds() / 86400)
+        fee_rate = config.FUTURES_FEE_PCT if pos.fee_rate is None else pos.fee_rate
+        funding_rate = config.FUNDING_RATE_DAILY if pos.funding_rate_daily is None else pos.funding_rate_daily
+        entry_fee = FuturesTrader._entry_fee_for(pos)
+        exit_fee = pos.quantity * mark * fee_rate
+        funding = pos.notional * funding_rate * age_days
+        net_pnl = (mark - pos.entry_price) * pos.quantity - entry_fee - exit_fee - funding
+        return {
+            "mark_price": mark, "age_days": age_days,
+            "pnl_usd": net_pnl,
+            "pnl_pct": net_pnl / pos.margin_used * 100 if pos.margin_used else 0.0,
+            "entry_fee_usd": entry_fee, "exit_fee_usd": exit_fee, "funding_usd": funding,
+        }
+
+    def get_equity_breakdown(self, now: datetime | None = None) -> dict:
+        now = now or datetime.now(timezone.utc)
+        estimates = [self.estimate_position_pnl(pos, now) for pos in self.get_open_positions()]
+        exit_fees = sum(row["exit_fee_usd"] for row in estimates)
+        funding = sum(row["funding_usd"] for row in estimates)
+        marked_equity = self.get_portfolio_value()
+        # Entry fees have already left free cash; do not deduct them twice.
+        return {
+            "marked_equity_usd": marked_equity,
+            "estimated_net_equity_usd": marked_equity - exit_fees - funding,
+            "unrealized_net_pnl_usd": sum(row["pnl_usd"] for row in estimates),
+            "realized_net_pnl_usd": self.get_stats()["total_net_pnl_usd"],
+            "estimated_exit_fees_usd": exit_fees, "estimated_funding_usd": funding,
+        }
 
     @staticmethod
     def _mark_price(pos: FuturesPosition) -> float:
@@ -890,7 +925,12 @@ class FuturesTrader:
             amount_usd=margin_usd,
             entry_change_24h=entry_change_24h,
             margin_mode="cross",
+            net_tp_pct=config.FUTURES_NET_TP_PCT,
+            fee_rate=config.FUTURES_FEE_PCT,
+            funding_rate_daily=config.FUNDING_RATE_DAILY,
         )
+        position.tp_price = self._net_tp_price(position, position.entry_time)
+        tp_price = position.tp_price
         projected_positions = self.get_open_positions() + [position]
         liq_price = self._cross_liquidation_price(
             position, projected_positions, projected_cash,
@@ -1039,7 +1079,12 @@ class FuturesTrader:
     @staticmethod
     def _net_tp_price(pos: FuturesPosition, now: datetime) -> float:
         hold_days = max((now - pos.entry_time).total_seconds() / 86400, 0.0)
-        return pos.entry_price * (1 + _gross_tp_move_for_leverage(pos.leverage, hold_days))
+        target = config.FUTURES_NET_TP_PCT if pos.net_tp_pct is None else pos.net_tp_pct
+        fee = config.FUTURES_FEE_PCT if pos.fee_rate is None else pos.fee_rate
+        funding = config.FUNDING_RATE_DAILY if pos.funding_rate_daily is None else pos.funding_rate_daily
+        # Solve quantity * (exit * (1-fee) - entry * (1+fee)) - funding = target * margin.
+        return (pos.entry_price * (1 + fee)
+                + (target * pos.margin_used + pos.notional * funding * hold_days) / pos.quantity) / (1 - fee)
 
     def _close(
         self,
@@ -1054,12 +1099,14 @@ class FuturesTrader:
         pos.exit_time = now
 
         hold_days = max((now - pos.entry_time).total_seconds() / 86400, 0)
-        funding_cost = pos.notional * config.FUNDING_RATE_DAILY * hold_days
+        funding_rate = config.FUNDING_RATE_DAILY if pos.funding_rate_daily is None else pos.funding_rate_daily
+        fee_rate = config.FUTURES_FEE_PCT if pos.fee_rate is None else pos.fee_rate
+        funding_cost = pos.notional * funding_rate * hold_days
         pos.funding_paid = funding_cost
 
         exit_notional = pos.quantity * exit_price
         entry_fee = self._entry_fee_for(pos)
-        exit_fee = exit_notional * config.FUTURES_FEE_PCT
+        exit_fee = exit_notional * fee_rate
 
         gross_pnl_usd = (exit_price - pos.entry_price) * pos.quantity
         cash_pnl_usd = gross_pnl_usd - exit_fee - funding_cost
@@ -1127,7 +1174,8 @@ class FuturesTrader:
                 "pnl_usd":         round(pos.pnl_usd, 4),
                 "entry_fee":       round(self._entry_fee_for(pos), 8),
                 "exit_fee":        round(
-                    (pos.quantity * pos.exit_price * config.FUTURES_FEE_PCT)
+                    (pos.quantity * pos.exit_price * (
+                        config.FUTURES_FEE_PCT if pos.fee_rate is None else pos.fee_rate))
                     if pos.exit_price else 0.0,
                     8,
                 ),
@@ -1144,9 +1192,8 @@ class FuturesTrader:
         if not path.exists():
             self.cash_balance = accounting.total_contributed_capital()
             return
-        _migrate_trade_history_fee_model(path)
-        _repair_positive_liquidation_history(path)
-        _repair_tp_hit_history(path)
+        # Historical fills are evidence, not predictions at today's TP/settings.
+        # Legacy correction helpers must never run implicitly during startup.
         loaded = 0
         with open(path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -1210,7 +1257,8 @@ class FuturesTrader:
 
     @staticmethod
     def _entry_fee_for(pos: FuturesPosition) -> float:
-        return pos.notional * config.FUTURES_FEE_PCT
+        rate = config.FUTURES_FEE_PCT if pos.fee_rate is None else pos.fee_rate
+        return pos.notional * rate
 
     def infer_starting_capital(self) -> float:
         """Infer pre-metadata starting capital from the paper account ledger."""
@@ -1394,6 +1442,9 @@ class FuturesTrader:
                     "breakeven_armed":   p.breakeven_armed,
                     "crash_protected":   p.crash_protected,
                     "margin_mode":       "cross",
+                    "net_tp_pct":        p.net_tp_pct,
+                    "fee_rate":          p.fee_rate,
+                    "funding_rate_daily": p.funding_rate_daily,
                 }
                 for p in open_pos
             ],
@@ -1433,6 +1484,9 @@ class FuturesTrader:
                     crash_protected=p.get("crash_protected", False),
                     margin_mode=p.get("margin_mode", "cross"),
                     status=FuturesPositionStatus.OPEN,
+                    net_tp_pct=p.get("net_tp_pct", config.FUTURES_NET_TP_PCT),
+                    fee_rate=p.get("fee_rate", config.FUTURES_FEE_PCT),
+                    funding_rate_daily=p.get("funding_rate_daily", config.FUNDING_RATE_DAILY),
                 )
                 self.positions.append(pos)
                 restored += 1
@@ -1523,23 +1577,29 @@ class FuturesTrader:
             p for p in self.get_trade_history()
             if p.status != FuturesPositionStatus.EXCLUDED
         ]
-        if not closed:
-            return {"total_trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0,
-                    "liquidations": 0}
-
-        wins = [p for p in closed if p.pnl_pct > 0]
+        wins = [p for p in closed if p.pnl_usd > 0]
+        losses = [p for p in closed if p.pnl_usd < 0]
+        gross_profit = sum(p.pnl_usd for p in wins)
+        gross_loss = -sum(p.pnl_usd for p in losses)
+        net_profit = gross_profit - gross_loss
         liqs = [p for p in closed if p.status == FuturesPositionStatus.LIQUIDATED]
         total_pnl = sum(p.pnl_pct for p in closed)
 
         return {
             "total_trades": len(closed),
             "wins": len(wins),
-            "losses": len(closed) - len(wins),
+            "losses": len(losses),
+            "breakevens": len(closed) - len(wins) - len(losses),
             "liquidations": len(liqs),
-            "win_rate": len(wins) / len(closed) * 100,
-            "avg_pnl": total_pnl / len(closed),
+            "win_rate": len(wins) / len(closed) * 100 if closed else 0,
+            "avg_pnl": total_pnl / len(closed) if closed else 0,
             "total_pnl": total_pnl,
-            "best_trade": max(closed, key=lambda p: p.pnl_pct).pnl_pct,
-            "worst_trade": min(closed, key=lambda p: p.pnl_pct).pnl_pct,
+            "total_net_pnl_usd": net_profit,
+            "avg_win_usd": gross_profit / len(wins) if wins else 0,
+            "avg_loss_usd": gross_loss / len(losses) if losses else 0,
+            "expectancy_usd": net_profit / len(closed) if closed else 0,
+            "profit_factor": gross_profit / gross_loss if gross_loss else None,
+            "best_trade": max((p.pnl_pct for p in closed), default=0),
+            "worst_trade": min((p.pnl_pct for p in closed), default=0),
             "total_funding_paid": sum(p.funding_paid for p in closed),
         }

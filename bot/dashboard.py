@@ -117,6 +117,8 @@ SETTINGS_HELP = {
     "Max open trades": "Maximum simultaneous futures paper positions. Lowering this does not force-close existing trades; it only blocks new entries until open count drops.",
     "Pre-trade wave check": "Before opening a futures trade, inspect the coin's recent 15m candles to avoid entries still making fresh lows.",
     "Min pre-trade score": "Minimum 0-100 wave score required before entry. Higher is stricter and opens fewer trades.",
+    "Require dip": "When enabled, empty slots wait until the configured 24h dip threshold is met. Disable only to restore the old always-invested refill policy.",
+    "Confirm rebound": "Requires two rising completed 15m closes, positive 1h momentum and a close above SMA20. This is a quality filter, not a prediction or a guaranteed win rate.",
     "Monthly contribution ($)": "Paper cash to add once per month for contribution/compounding simulation.",
     "Contribution day": "Calendar day of month when the paper contribution is applied. If the month is shorter, the app uses the last valid day.",
     "Auto-start futures": "When enabled, futures scanning resumes automatically on app launch after settings are confirmed.",
@@ -340,7 +342,7 @@ class Dashboard:
         self.winrate_var   = tk.StringVar(value="0.0%")
         self.open_var      = tk.StringVar(value="0")
         stats_help = {
-            "PORTFOLIO": "Estimated futures paper equity: free cash plus current marked value of open positions.",
+            "NET EQUITY": "Estimated futures paper equity if all open positions closed at cached prices, after modeled exit fees and funding. Entry fees have already been paid. Not an exchange-exact liquidation balance.",
             "CASH": "Free paper cash/margin available for new futures trades.",
             "PNL": "Portfolio performance versus contributed futures paper capital, including unrealized open P&L.",
             "OPEN": "Number of currently open futures paper positions.",
@@ -349,7 +351,7 @@ class Dashboard:
         }
 
         for label_text, var, sty in [
-            ("PORTFOLIO", self.portfolio_var, "Big.TLabel"),
+            ("NET EQUITY", self.portfolio_var, "Big.TLabel"),
             ("CASH",      self.cash_var,      "Header.TLabel"),
             ("PNL",       self.pnl_var,       "Header.TLabel"),
             ("OPEN",      self.open_var,       "Header.TLabel"),
@@ -368,6 +370,13 @@ class Dashboard:
             self._tip(card, help_text)
             self._tip(label, help_text)
             self._tip(value, help_text)
+
+        self.profit_breakdown_var = tk.StringVar(value="")
+        profit_line = ttk.Label(self.root, textvariable=self.profit_breakdown_var,
+                               foreground="#c9d1d9", font=("Consolas", 9), padding=(19, 4))
+        profit_line.pack(fill="x")
+        profit_line.bind("<Configure>", lambda event: profit_line.configure(wraplength=max(100, event.width - 38)))
+        self._tip(profit_line, "Realized is the net result of closed trades in this session. Open net P&L includes modeled entry/exit fees and accrued funding. Estimates use cached market prices; a high closed-trade win rate can still coexist with large open losses.")
 
         # ── Notebook ──
         nb = ttk.Notebook(self.root)
@@ -432,7 +441,9 @@ class Dashboard:
         self.status_var.set("Telegram dashboard menu sent.")
 
     def _telegram_futures_snapshot(self) -> str:
-        portfolio = self.trader.get_portfolio_value()
+        now = datetime.now(timezone.utc)
+        breakdown = self.trader.get_equity_breakdown(now)
+        portfolio = breakdown["estimated_net_equity_usd"]
         cash = self.trader.cash_balance
         stats = self.trader.get_stats()
         initial = (
@@ -442,7 +453,7 @@ class Dashboard:
         )
         pnl_pct = ((portfolio - initial) / initial) * 100 if initial > 0 else 0.0
         open_positions = list(self.trader.get_open_positions())
-        total_pnl = sum(p.pnl_usd for p in self.trader.get_trade_history())
+        total_pnl = breakdown["realized_net_pnl_usd"]
         last_scan = (
             self._last_cycle_time.strftime("%Y-%m-%d %H:%M:%S UTC")
             if self._last_cycle_time
@@ -452,8 +463,9 @@ class Dashboard:
         lines = [
             "📊 <b>TradingBot23 Futures Paper</b>",
             f"Mode: <b>{mode}</b>  |  New trades: <b>{config.LEVERAGE}x cross</b>",
-            f"Portfolio: <b>${portfolio:,.2f}</b>  |  Cash: <b>${cash:,.2f}</b>",
+            f"Net equity est.: <b>${portfolio:,.2f}</b>  |  Cash: <b>${cash:,.2f}</b>",
             f"PNL: <b>{pnl_pct:+.2f}%</b>  |  Realized: <b>${total_pnl:+,.2f}</b>",
+            f"Open net est.: <b>${breakdown['unrealized_net_pnl_usd']:+,.2f}</b>",
             f"Open: <b>{len(open_positions)}</b>  |  Trades: <b>{stats.get('total_trades', 0)}</b>  |  Win: <b>{stats.get('win_rate', 0):.1f}%</b>",
             f"Last scan: {last_scan}",
         ]
@@ -462,10 +474,11 @@ class Dashboard:
             lines.append("<b>Open positions</b>")
             for pos in open_positions[:6]:
                 current = pos.last_known_price or pos.entry_price
+                estimate = self.trader.estimate_position_pnl(pos, now)
                 lines.append(
                     f"{tg.escape_html(pos.symbol)} {pos.leverage}x | "
                     f"${pos.margin_used:,.2f} | now ${current:,.4f} | "
-                    f"PNL {pos.pnl_pct:+.2f}% | liq ${pos.liquidation_price:,.4f}"
+                    f"Net PNL {estimate['pnl_pct']:+.2f}% | liq ${pos.liquidation_price:,.4f}"
                 )
             if len(open_positions) > 6:
                 lines.append(f"+{len(open_positions) - 6} more open position(s)")
@@ -635,7 +648,7 @@ class Dashboard:
 
         pos_cols = ("symbol","amount","lev","entry","current","pnl","trigger","tp","sl","age")
         self.pos_tree = ttk.Treeview(pf, columns=pos_cols, show="headings", height=5)
-        pnl_heading = "P&L % (leveraged)"
+        pnl_heading = "NET P&L % / PRICE"
         risk_heading = "CROSS LIQ"
         for col, heading, width in [
             ("symbol","SYMBOL",70),("amount","AMOUNT $",85),("lev","ENTRY LEV",70),
@@ -978,8 +991,17 @@ class Dashboard:
         ttk.Button(ctrl, text="Reset Futures Paper", style="Btn.TButton",
                    command=self._reset_futures_paper).pack(side="left", padx=(6, 0))
         self._hist_summary_var = tk.StringVar(value="")
-        ttk.Label(ctrl, textvariable=self._hist_summary_var, foreground="#8b949e",
-                  background="#0d1117", font=("Consolas", 9)).pack(side="left", padx=12)
+        summary_label = ttk.Label(parent, textvariable=self._hist_summary_var, foreground="#8b949e",
+                                  background="#0d1117", font=("Consolas", 9), wraplength=950)
+        summary_label.pack(fill="x", padx=15, pady=(0, 4))
+        summary_label.bind("<Configure>", lambda e: summary_label.configure(wraplength=max(250, e.width)))
+        self._hist_metrics_var = tk.StringVar(value="")
+        metrics_label = ttk.Label(parent, textvariable=self._hist_metrics_var,
+                                  foreground="#f0f6fc", background="#0d1117",
+                                  font=("Consolas", 10), wraplength=950)
+        metrics_label.pack(fill="x", padx=15, pady=(0, 8))
+        metrics_label.bind("<Configure>", lambda e: metrics_label.configure(wraplength=max(250, e.width)))
+        self._tip(metrics_label, "Closed-trade net results including modeled fees and funding. Profit factor is total winning dollars divided by total losing dollars; above 1 is positive realized performance. Expectancy is average net dollars per closed trade. Open losses are not included.")
 
         hf = tk.Frame(parent, bg="#0d1117")
         hf.pack(fill="both", expand=True, padx=15, pady=(0, 8))
@@ -1021,6 +1043,12 @@ class Dashboard:
             self.hist_tree.delete(item)
 
         path = _history_csv()
+        stats = self.trader.get_stats()
+        pf = stats.get("profit_factor")
+        pf_text = f"{pf:.2f}" if pf is not None else "N/A (no losses)"
+        self._hist_metrics_var.set(
+            f"Profit factor: {pf_text}  |  Expectancy: ${stats['expectancy_usd']:+.2f}/trade  |  "
+            f"Avg win: ${stats['avg_win_usd']:.2f}  |  Avg loss: ${stats['avg_loss_usd']:.2f}")
         if not path.exists():
             note = self._futures_history_session_note()
             self._hist_summary_var.set("No current-session trade history yet." + note)
@@ -2477,8 +2505,16 @@ class Dashboard:
     # ── Settings tab ──────────────────────────────────────────────────────────
 
     def _build_settings_tab(self, parent):
-        body = tk.Frame(parent, bg="#0d1117", padx=15, pady=14)
-        body.pack(fill="both", expand=True)
+        canvas = tk.Canvas(parent, bg="#0d1117", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        body = tk.Frame(canvas, bg="#0d1117", padx=15, pady=14)
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_window, width=e.width))
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
         settings_panel = tk.Frame(body, bg="#0d1117")
         settings_panel.pack(side="left", fill="y", anchor="nw")
@@ -2659,6 +2695,14 @@ class Dashboard:
         pretrade_label.grid(row=9, column=0, sticky="w", pady=4)
         pretrade_check = ttk.Checkbutton(pretrade_frame, text="Enable", variable=self._s_pretrade_enabled)
         pretrade_check.pack(side="left")
+        self._s_confirm_rebound = tk.BooleanVar(value=config.PRE_TRADE_CONFIRMATION_ENABLED)
+        confirm_check = ttk.Checkbutton(pretrade_frame, text="Confirm rebound", variable=self._s_confirm_rebound)
+        confirm_check.pack(side="left", padx=(8, 0))
+        self._tip(confirm_check, SETTINGS_HELP["Confirm rebound"])
+        self._s_require_dip = tk.BooleanVar(value=config.FUTURES_REQUIRE_DIP)
+        dip_check = ttk.Checkbutton(pretrade_frame, text="Require dip", variable=self._s_require_dip)
+        dip_check.pack(side="left", padx=(8, 0))
+        self._tip(dip_check, SETTINGS_HELP["Require dip"])
         self._tip(pretrade_label, SETTINGS_HELP["Pre-trade wave check"])
         self._tip(pretrade_check, SETTINGS_HELP["Pre-trade wave check"])
 
@@ -2782,6 +2826,8 @@ class Dashboard:
             max_open_trades = int(self._s_max_open_trades.get())
             pretrade_enabled = self._s_pretrade_enabled.get()
             pretrade_score = float(self._s_pretrade_score.get())
+            confirm_rebound = self._s_confirm_rebound.get()
+            require_dip = self._s_require_dip.get()
             monthly_contribution = float(self._s_monthly_contribution.get())
             monthly_day = int(self._s_monthly_day.get())
             auto_start = self._s_auto_start.get()
@@ -2834,6 +2880,8 @@ class Dashboard:
             "MAX_OPEN_TRADES":    max_open_trades,
             "PRE_TRADE_ANALYSIS_ENABLED": "true" if pretrade_enabled else "false",
             "PRE_TRADE_MIN_SCORE": pretrade_score,
+            "PRE_TRADE_CONFIRMATION_ENABLED": "true" if confirm_rebound else "false",
+            "FUTURES_REQUIRE_DIP": "true" if require_dip else "false",
             "MONTHLY_CONTRIBUTION_USD": monthly_contribution,
             "MONTHLY_CONTRIBUTION_DAY": monthly_day,
             "AUTO_START_FUTURES": "true" if auto_start else "false",
@@ -2857,6 +2905,8 @@ class Dashboard:
         config.TOP_N_LOSERS       = max(config.TOP_N_LOSERS, config.MAX_OPEN_TRADES)
         config.PRE_TRADE_ANALYSIS_ENABLED = pretrade_enabled
         config.PRE_TRADE_MIN_SCORE = pretrade_score
+        config.PRE_TRADE_CONFIRMATION_ENABLED = confirm_rebound
+        config.FUTURES_REQUIRE_DIP = require_dip
         config.MONTHLY_CONTRIBUTION_USD = monthly_contribution
         config.MONTHLY_CONTRIBUTION_DAY = monthly_day
         config.AUTO_START_FUTURES = auto_start
@@ -3577,7 +3627,8 @@ class Dashboard:
         )
 
     def _update_stats(self):
-        portfolio      = self.trader.get_portfolio_value()
+        breakdown      = self.trader.get_equity_breakdown()
+        portfolio      = breakdown["estimated_net_equity_usd"]
         cash           = self.trader.cash_balance
         stats          = self.trader.get_stats()
         initial        = (
@@ -3594,6 +3645,12 @@ class Dashboard:
         self.open_var.set(str(len(open_positions)))
         self.trades_var.set(str(stats.get("total_trades", 0)))
         self.winrate_var.set(f"{stats.get('win_rate', 0):.1f}%")
+        self.profit_breakdown_var.set(
+            f"Realized ${breakdown['realized_net_pnl_usd']:+,.2f}  |  "
+            f"Open net est. ${breakdown['unrealized_net_pnl_usd']:+,.2f}  |  "
+            f"Exit fee est. ${breakdown['estimated_exit_fees_usd']:,.2f}  |  "
+            f"Funding est. ${breakdown['estimated_funding_usd']:,.2f}"
+        )
 
     def _update_positions(self):
         for item in self.pos_tree.get_children():
@@ -3608,8 +3665,8 @@ class Dashboard:
             leverage = getattr(pos, "leverage", 1)
             if current and pos.entry_price > 0:
                 price_chg = (current - pos.entry_price) / pos.entry_price
-                lev_pnl   = price_chg * leverage * 100
-                pnl_str = f"{lev_pnl:+.2f}% ({price_chg*100:+.2f}% price)"
+                estimate = self.trader.estimate_position_pnl(pos, now)
+                pnl_str = f"{estimate['pnl_pct']:+.2f}% ({price_chg*100:+.2f}% price)"
             else:
                 pnl_str = "--"
             risk_price = self._num(getattr(pos, "liquidation_price", 0.0), 0.0)

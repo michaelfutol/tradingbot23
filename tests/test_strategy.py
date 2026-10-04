@@ -3,6 +3,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from bot import config
 from bot.modules.strategy import Strategy
@@ -22,7 +23,8 @@ class TestStrategy(unittest.TestCase):
         config.TOP_N_COINS = 50
         config.TOP_N_LOSERS = 5
         config.MAX_OPEN_TRADES = 5
-        config.PRE_TRADE_ANALYSIS_ENABLED = True
+        config.PRE_TRADE_ANALYSIS_ENABLED = False
+        config.FUTURES_REQUIRE_DIP = False
         config.PRE_TRADE_MIN_SCORE = 60
         config.PAPER_SYMBOL_GUARD_ENABLED = True
         config.PAPER_SYMBOL_GUARD_LOOKBACK_DAYS = 30
@@ -141,6 +143,7 @@ class TestStrategy(unittest.TestCase):
     def test_execute_signals_waits_when_pre_trade_wave_filter_blocks(self):
         """A dip is not opened when the wave analysis says it is still falling."""
 
+        config.PRE_TRADE_ANALYSIS_ENABLED = True
         class FakeTrader:
             def __init__(self):
                 self.positions = []
@@ -171,6 +174,7 @@ class TestStrategy(unittest.TestCase):
     def test_execute_signals_skips_symbol_quarantined_by_paper_history(self):
         """Paper history can block a coin before the wave analysis is even run."""
 
+        config.PRE_TRADE_ANALYSIS_ENABLED = True
         class FakeTrader:
             def __init__(self):
                 self.positions = []
@@ -206,6 +210,7 @@ class TestStrategy(unittest.TestCase):
     def test_execute_signals_opens_when_pre_trade_wave_filter_allows(self):
         """A dip opens only after the wave score passes."""
 
+        config.PRE_TRADE_ANALYSIS_ENABLED = True
         class FakeTrader:
             def __init__(self):
                 self.positions = []
@@ -372,6 +377,7 @@ class TestStrategy(unittest.TestCase):
         """A rejected fill candidate should not consume the open slot."""
 
         config.MAX_OPEN_TRADES = 1
+        config.PRE_TRADE_ANALYSIS_ENABLED = True
 
         class FakeFetcher:
             def get_top_coins(self):

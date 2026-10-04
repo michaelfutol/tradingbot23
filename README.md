@@ -8,9 +8,9 @@ Runs on Windows as a standalone EXE — no Python, no coding required for end us
 
 ## What It Does
 
-TradingBot23 identifies the **top 5 biggest losers** among the top 50 coins by market cap each month, then trades them using a mean-reversion strategy: large-cap coins that dip tend to bounce back. The bot buys the dip, waits for the bounce, and exits at a fixed profit target.
+TradingBot23 selects a monthly loser basket from the configured top-50 market-cap universe, excluding stablecoins and unsupported futures symbols. Eligible dips must pass completed-candle rebound checks and risk guards before paper entry. A dip is not a guarantee of recovery or profit.
 
-**Data sources (100% free, no API key required):**
+**Public market-data sources (availability and rate limits vary):**
 - [CoinGecko](https://coingecko.com) — market cap rankings and 24h price changes
 - [Binance public API](https://binance.com) — real-time prices for TP/SL monitoring
 - Binance P2P public search — read-only USDT/PHP buy/sell ads for arbitrage monitoring
@@ -19,10 +19,10 @@ TradingBot23 identifies the **top 5 biggest losers** among the top 50 coins by m
 
 ## Quick Start — Windows EXE (No Python needed)
 
-1. Download `TradingBot23.exe` from [Releases](https://github.com/michaelfutol/tradingbot23/releases)
-2. Extract and open the `.env` file with Notepad
-3. Add your Binance API keys (read-only keys work for paper trading)
-4. Double-click `TradingBot23.exe`
+1. For the latest pushed build, open [GitHub Actions](https://github.com/michaelfutol/tradingbot23/actions/workflows/build.yml), select the newest successful run, and download its `TradingBot23-Windows` artifact. Release assets update only when a release is published.
+2. Extract the artifact into its own folder. Do not copy another person's `.env`, `data`, or `logs`.
+3. Double-click `TradingBot23.exe` and complete the first-run setup. Read-only Binance keys are sufficient for paper trading; do not enable withdrawal permissions.
+4. Review Settings, apply them, and press Resume. New installs remain paused until settings are confirmed.
 
 The bot runs in **paper trading mode only**. It does not place real orders.
 
@@ -30,14 +30,17 @@ The bot runs in **paper trading mode only**. It does not place real orders.
 
 ## Dashboard
 
-The app has a full GUI with five tabs:
+The app has a full GUI with these tabs. The summary shows estimated net equity and separates realized net profit from open net P&L, modeled exit fees, and funding.
 
 | Tab | What you see |
 |---|---|
-| **Open** | Open positions with entry price, current price, entry leverage, P&L%, TP, cross-liquidation price, age |
+| **Open** | Open positions with entry price, cached current price, entry leverage, estimated net P&L%, TP, cross-liquidation estimate, age |
+| **Risk** | Entry guards, kill switch, exposure limits, and decision log |
 | **Charts** | Equity curve, trade return distribution, exit breakdown pie, cumulative P&L |
-| **History** | Every trade ever made, loaded from disk, plus exportable performance reports |
+| **History** | Current-session closed trades, net expectancy, profit factor, exports, and a reset that archives the old session |
 | **P2P Arb** | USDT/PHP P2P cycle command center with route sizing, net profit estimate, route grade, warnings, and journal |
+| **P2P History** | Paper cycles and hold transactions with their balance changes |
+| **Ledger** | Local operational and accounting events |
 | **Settings** | Change leverage, TP%, SL on/off, capital, monthly contribution, max hold days, and view the next 12 contribution markers |
 
 ---
@@ -46,7 +49,7 @@ The app has a full GUI with five tabs:
 
 ### Core Thesis
 
-Top-50 coins by market cap (BTC, ETH, SOL, BNB, etc.) have strong institutional backing and historically rebound from short-term dips within days. The strategy systematically buys these dips and exits at a small profit target.
+The strategy tests mean reversion in liquid, higher-market-cap futures coins. Market-cap rank does not establish safety: coins can continue falling, fail, or never regain the entry price. Judge results by net expectancy, profit factor, drawdown and open losses, not only closed-trade win rate. Cross margin shares collateral; it does not make leveraged losses safe.
 
 ### Rules
 
@@ -54,9 +57,9 @@ Top-50 coins by market cap (BTC, ETH, SOL, BNB, etc.) have strong institutional 
 |---|---|---|
 | Universe | Top 50 by market cap | Via CoinGecko free API, no key needed |
 | Basket | Top 5 worst 24h performers | Locked monthly, refreshed on the 1st |
-| Entry signal | 24h change ≤ −2% **OR** slot empty | Scanned every 5 minutes |
+| Entry signal | Configured 24h dip plus rebound confirmation | Scanned every 5 minutes; a free slot alone does not trigger entry by default |
 | Take profit | +1% NET (after all fees) | Gross price target auto-computed |
-| Stop loss | Disabled by default | At 1x leverage, top-50 coins rebound reliably |
+| Stop loss | Disabled by default | Optional; disabling it leaves expiry, funding and cross-account losses possible |
 | Liquidation guard | Always active | Uses cross-margin account equity so free cash backs every futures paper position |
 | Max hold | 3 days | Auto-close at market if TP not reached |
 | Position size | 20% of portfolio | Dynamic compounding — grows with your portfolio |
@@ -77,16 +80,19 @@ Top-50 coins by market cap (BTC, ETH, SOL, BNB, etc.) have strong institutional 
                       ▼
               Every 5 minutes:
                 ├── Check open positions (TP / liquidation / expiry)
-                ├── Scan basket coins for −2% dip → open position
-                └── Fill any empty slots with worst performers (always invested)
+                ├── Scan basket coins for the configured dip
+                ├── Validate fresh completed futures candles and rebound structure
+                └── Open eligible candidates only if risk and cooldown checks allow
 ```
 
-### Win-Rate Enhancers
+### Entry and Risk Filters
 
-- **Break-even SL trailing** — once a position moves +0.5% in your favor, the stop slides up to entry + fees. Even if price reverses, you exit at near-zero loss instead of the full stop.
+- **Optional stop-loss handling** — hard stops and emergency crash stops are opt-in; cross margin does not guarantee protection from account losses.
 - **Loss cooldown** — after a stop hit on a coin, that coin is blocked for 24 hours to avoid stacking losses on a falling knife.
 - **TP cooldown** — after a TP hit on a coin, waits 1 hour before re-entering the same coin (prevents scalping the same coin in a loop).
-- **Always invested** — if a basket slot is empty and you have free cash, the bot fills it with the current worst performer without waiting for a −2% dip signal.
+- **Dip required by default** — empty slots wait for an eligible dip rather than automatically staying invested.
+- **Rebound confirmation** — two rising completed 15m closes, positive 1h momentum and a close above SMA20. Missing or stale analysis blocks entry.
+- **Cost-aware reporting** — open net P&L estimates include original entry/exit fee assumptions and modeled funding. These estimates are not exchange-exact live balances.
 
 ---
 
@@ -158,6 +164,8 @@ All settings live in `.env`. The Settings tab in the GUI lets you change most of
 | `LOSS_COOLDOWN_HOURS` | `24` | Hours to skip a coin after SL hit |
 | `TP_COOLDOWN_HOURS` | `1` | Hours to skip a coin after TP hit |
 | `PRE_TRADE_ANALYSIS_ENABLED` | `true` | Analyze Binance 15m candles before opening a futures trade |
+| `FUTURES_REQUIRE_DIP` | `true` | Empty slots still require the configured dip threshold |
+| `PRE_TRADE_CONFIRMATION_ENABLED` | `true` | Require completed-candle rebound confirmation before entry |
 | `PRE_TRADE_MIN_SCORE` | `60` | Minimum 0-100 wave score required before entry |
 | `PRE_TRADE_MIN_REBOUND_PCT` | `0.35` | Required bounce from the 24h low to avoid fresh-low entries |
 | `PRE_TRADE_MAX_1H_DROP_PCT` | `0.75` | Blocks entry if the last 1h move is still dropping too hard |

@@ -8,8 +8,37 @@ on:
     types: [created]
 
 jobs:
-  build-windows:
+  verify:
     runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run paper trading regression tests
+        run: python -m pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Lint web dashboard
+        working-directory: web
+        run: npm run lint
+      - name: Build web dashboard
+        working-directory: web
+        run: npm run build
+
+  build-windows:
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +70,7 @@ jobs:
           files: dist/TradingBot23.exe
 
   build-mac:
+    needs: verify
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
