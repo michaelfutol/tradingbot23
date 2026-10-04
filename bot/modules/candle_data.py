@@ -1,4 +1,4 @@
-"""Validated, completed Binance candles for entry decisions."""
+"""Validated completed derivatives candles in a shared exchange-neutral format."""
 
 import math
 from datetime import datetime, timezone

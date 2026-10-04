@@ -24,6 +24,10 @@ data/*.json
 data/*.csv
 data/*.txt
 data/backups/
+data/**
+!data/.gitkeep
+**/bridge_access.json
+**/.paper-owner.lock
 logs/*.log
 
 # IDE

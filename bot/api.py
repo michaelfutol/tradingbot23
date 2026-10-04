@@ -15,6 +15,7 @@ from bot import config
 from bot.modules.data_fetcher import DataFetcher
 from bot.modules.futures_trader import FuturesTrader
 from bot.modules.strategy import Strategy
+from bot.modules.account_lock import AccountLock
 
 logger = logging.getLogger(__name__)
 _security = HTTPBasic(auto_error=False)
@@ -52,9 +53,10 @@ def get_strategy() -> Strategy:
 async def lifespan(app):
     if not os.getenv("WEB_USERNAME") or len(os.getenv("WEB_PASSWORD", "")) < 16:
         raise RuntimeError("Set WEB_USERNAME and a WEB_PASSWORD of at least 16 characters.")
-    get_strategy()
-    logger.info("Authenticated paper API started; one worker required.")
-    yield
+    with AccountLock(config.DATA_DIR):
+        get_strategy()
+        logger.info("Authenticated paper API started; one worker required.")
+        yield
 
 
 app = FastAPI(title="TradingBot23 API", version="1.0.0", lifespan=lifespan,

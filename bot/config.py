@@ -33,8 +33,14 @@ TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 # --- Capital & Position Sizing ---
 CAPITAL_USD = float(os.getenv("CAPITAL_USD", "10000"))
 PER_TRADE_PCT = float(os.getenv("PER_TRADE_PCT", "0.20"))  # 20% of current balance per coin
-MONTHLY_CONTRIBUTION_USD = float(os.getenv("MONTHLY_CONTRIBUTION_USD", "0"))
-MONTHLY_CONTRIBUTION_DAY = int(os.getenv("MONTHLY_CONTRIBUTION_DAY", "1"))
+FUTURES_MAX_ACCOUNT_LEVERAGE = float(os.getenv("FUTURES_MAX_ACCOUNT_LEVERAGE", "3"))
+FUTURES_CASH_RESERVE_PCT = float(os.getenv("FUTURES_CASH_RESERVE_PCT", "0.20"))
+FUTURES_EXCHANGE = os.getenv("FUTURES_EXCHANGE", "binance").strip().lower()
+LOCAL_BRIDGE_ENABLED = os.getenv("LOCAL_BRIDGE_ENABLED", "true").lower() == "true"
+LOCAL_BRIDGE_PORT = int(os.getenv("LOCAL_BRIDGE_PORT", "7233"))
+OKX_API_KEY = os.getenv("OKX_API_KEY", "")
+OKX_API_SECRET = os.getenv("OKX_API_SECRET", "")
+OKX_API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 
 MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "3"))  # Auto-close after 3 days
 DIP_THRESHOLD_PCT = float(os.getenv("DIP_THRESHOLD_PCT", "0.02"))  # -2% dip to enter
@@ -151,7 +157,7 @@ FUNDING_RATE_DAILY = float(os.getenv("FUNDING_RATE_DAILY", "0.0003"))
 # At 2x leverage, a 0.5% net price move = ~1% net PNL on margin.
 FUTURES_NET_TP_PCT = float(os.getenv("FUTURES_NET_TP_PCT", "0.01"))   # 1% net — matches backtest
 FUTURES_NET_SL_PCT = float(os.getenv("FUTURES_NET_SL_PCT", "0.015"))  # 1.5% net — reference only when SL disabled
-# At 1x leverage, top-50 coins historically rebound — hold until TP or expiry, no SL.
+# SL is opt-in; a top-50 rank does not guarantee recovery.
 # Set to "true" only if you want hard stop-losses re-enabled.
 FUTURES_USE_SL = os.getenv("FUTURES_USE_SL", "false").lower() == "true"
 # 5-minute dip threshold for optional short-window futures entry checks.
@@ -227,6 +233,12 @@ def validate():
     log = logging.getLogger(__name__)
 
     errors = []
+    if FUTURES_EXCHANGE not in {"okx", "binance"}:
+        errors.append("FUTURES_EXCHANGE must be okx or binance.")
+    if not 0 <= FUTURES_CASH_RESERVE_PCT < 1:
+        errors.append("Cash reserve must be between 0 and 1 (exclusive).")
+    if FUTURES_MAX_ACCOUNT_LEVERAGE < 0:
+        errors.append("Account exposure cap cannot be negative.")
     if TRADING_MODE == "live":
         errors.append("Live trading is not implemented. Use TRADING_MODE=paper.")
     if errors:
@@ -234,7 +246,7 @@ def validate():
 
     # --- Risk/reward sanity checks ---
     # Required win rate to break even: SL / (TP + SL)
-    if FUTURES_NET_TP_PCT > 0 and FUTURES_NET_SL_PCT > 0:
+    if FUTURES_USE_SL and FUTURES_NET_TP_PCT > 0 and FUTURES_NET_SL_PCT > 0:
         rr_ratio = FUTURES_NET_SL_PCT / FUTURES_NET_TP_PCT
         breakeven_winrate = FUTURES_NET_SL_PCT / (FUTURES_NET_TP_PCT + FUTURES_NET_SL_PCT) * 100
 

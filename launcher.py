@@ -10,6 +10,12 @@ import sys
 import os
 from pathlib import Path
 
+if "--bridge" in sys.argv:
+    sys.argv.remove("--bridge")
+    from bot.bridge_cli import main as bridge_main
+    bridge_main()
+    sys.exit(0)
+
 if getattr(sys, "frozen", False):
     os.chdir(Path(sys.executable).parent)
     os.environ.setdefault("DOTENV_PATH", str(Path(sys.executable).parent / ".env"))
@@ -39,16 +45,15 @@ except ValueError as e:
     input("Press Enter to close...")
     sys.exit(1)
 
-fetcher = DataFetcher()
-trader = FuturesTrader()
-strategy = Strategy(fetcher=fetcher, trader=trader)
-
 from bot.dashboard import Dashboard
+from bot.modules.account_lock import AccountLock
 
 if __name__ == "__main__":
     try:
-        dashboard = Dashboard(strategy)
-        dashboard.run()
+        with AccountLock(config.DATA_DIR):
+            strategy = Strategy(fetcher=DataFetcher(), trader=FuturesTrader())
+            dashboard = Dashboard(strategy)
+            dashboard.run()
     except KeyboardInterrupt:
         print("\nBot stopped.")
     except Exception as e:

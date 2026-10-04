@@ -19,6 +19,7 @@ from bot.modules.data_fetcher import DataFetcher
 from bot.modules.futures_trader import FuturesTrader
 from bot.modules.strategy import Strategy
 from bot.setup_wizard import ensure_setup
+from bot.modules.account_lock import AccountLock
 
 # Graceful shutdown
 _running = True
@@ -216,13 +217,22 @@ def main():
 
     if args.mode == "backtest":
         run_backtest(args.start, args.end)
-    elif args.dashboard:
-        run_dashboard(force_snapshot=args.force_snapshot)
     elif args.api:
         import uvicorn
         uvicorn.run("bot.api:app", host="127.0.0.1", port=8000, reload=False)
     else:
-        run_trading(force_snapshot=args.force_snapshot)
+        try:
+            with AccountLock(config.DATA_DIR):
+                if args.dashboard:
+                    run_dashboard(force_snapshot=args.force_snapshot)
+                else:
+                    run_trading(force_snapshot=args.force_snapshot)
+        except RuntimeError as exc:
+            print(str(exc))
+            if args.dashboard:
+                from tkinter import messagebox
+                messagebox.showerror("TradingBot23", str(exc))
+            sys.exit(1)
 
 
 if __name__ == "__main__":

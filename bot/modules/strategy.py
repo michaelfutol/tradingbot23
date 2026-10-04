@@ -688,16 +688,6 @@ class Strategy:
         self._paper_guard_reason_cache = {}
         self._entry_analysis_cache = {}
 
-        if hasattr(self.trader, "apply_monthly_contribution"):
-            contributed = self.trader.apply_monthly_contribution(now)
-            summary["cash_contributed"] = contributed
-            if contributed:
-                logger.info(
-                    "Monthly paper contribution applied: $%.2f | Cash: $%.2f",
-                    contributed, self.trader.cash_balance,
-                )
-                tg.alert_contribution(contributed, self.trader.cash_balance, now.strftime("%Y-%m"))
-
         # Always manage existing exposure before any universe/network refresh.
         closed = self.trader.check_positions()
         summary["positions_closed"] = len(closed)

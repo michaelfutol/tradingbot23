@@ -16,19 +16,20 @@ import csv
 import json
 import logging
 import math
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from binance.client import Client as BinanceClient
-from binance.exceptions import BinanceAPIException
 
 from bot import config
 from bot.modules import accounting
 from bot.modules import telegram_notifier as tg
 from bot.modules.event_ledger import append_event
 from bot.modules.candle_data import closed_candles
+from bot.modules.okx_bridge import OKXBridge
 
 logger = logging.getLogger(__name__)
 MAINTENANCE_MARGIN_RATE = 0.005
@@ -362,6 +363,7 @@ class FuturesPosition:
     net_tp_pct: float | None = None
     fee_rate: float | None = None
     funding_rate_daily: float | None = None
+    mark_updated_at: str | None = None
 
 
 @dataclass
@@ -608,7 +610,16 @@ class FuturesTrader:
         self._client: BinanceClient | None = None
         self._load_trade_history()
         self._load_open_positions()
+        if self.get_open_positions() and self._saved_exchange != config.FUTURES_EXCHANGE:
+            raise ValueError("Open paper positions use another exchange; select their original price source before starting.")
+        if self.account_capital_usd is None:
+            self.account_capital_usd = accounting.total_contributed_capital()
         self._reconcile_cash_balance_with_ledger()
+        try:
+            self.sync_starting_capital(config.CAPITAL_USD)
+        except ValueError:
+            logger.warning("Requested deposit baseline exceeds available withdrawal cash; review Settings")
+        self._save_open_positions()
 
         logger.info(
             "FuturesTrader initialized | Cross margin | Leverage: %dx | "
@@ -621,7 +632,7 @@ class FuturesTrader:
     @property
     def client(self) -> BinanceClient:
         if self._client is None:
-            self._client = BinanceClient(
+            self._client = OKXBridge() if config.FUTURES_EXCHANGE == "okx" else BinanceClient(
                 self.api_key, self.api_secret, testnet=config.BINANCE_TESTNET,
             )
         return self._client
@@ -631,19 +642,15 @@ class FuturesTrader:
         return f"{symbol}USDT"
 
     def get_current_price(self, symbol: str) -> float | None:
-        """Fetch current price from Binance USDT-M futures."""
+        """Fetch a fresh derivatives mark, never fall back to spot."""
         pair = self._trading_pair(symbol)
         try:
             ticker = self.client.futures_symbol_ticker(symbol=pair)
-            return float(ticker["price"])
-        except BinanceAPIException:
-            try:
-                # Price-data fallback only. The app still never opens exchange orders.
-                ticker = self.client.get_symbol_ticker(symbol=pair)
-                return float(ticker["price"])
-            except BinanceAPIException as e:
-                logger.error("Failed to get price for %s: %s", pair, e)
-                return None
+            price = float(ticker["price"])
+            return price if math.isfinite(price) and price > 0 else None
+        except Exception:
+            logger.warning("No fresh %s derivatives mark for %s", config.FUTURES_EXCHANGE, pair)
+            return None
 
     def get_5m_change(self, symbol: str) -> float | None:
         """Compute true 5-minute % price change from Binance kline data.
@@ -656,14 +663,8 @@ class FuturesTrader:
             klines = self.client.futures_klines(
                 symbol=pair, interval="5m", limit=2,
             )
-        except BinanceAPIException:
-            try:
-                klines = self.client.get_klines(
-                    symbol=pair, interval="5m", limit=2,
-                )
-            except BinanceAPIException as e:
-                logger.debug("No kline data for %s: %s", pair, e)
-                return None
+        except Exception:
+            return None
 
         if len(klines) < 2:
             return None
@@ -830,6 +831,9 @@ class FuturesTrader:
         if config.is_futures_excluded_symbol(symbol):
             logger.warning("Skipping %s — excluded from futures paper universe", symbol)
             return None
+        if len(self.get_open_positions()) >= config.MAX_OPEN_TRADES:
+            logger.info("No open slot for %s", symbol)
+            return None
 
         self._normalize_cash_balance()
         for pos in self.positions:
@@ -881,16 +885,29 @@ class FuturesTrader:
         portfolio_value = self.get_portfolio_value()
         margin_usd = margin_usd or (portfolio_value * config.PER_TRADE_PCT)
 
-        max_margin_with_entry_fee = self.cash_balance / (1 + self.leverage * config.FUTURES_FEE_PCT)
+        net_equity = self.get_equity_breakdown()["estimated_net_equity_usd"]
+        reserve = max(0.0, net_equity * config.FUTURES_CASH_RESERVE_PCT)
+        available = max(0.0, self.cash_balance - reserve)
+        if config.FUTURES_MAX_ACCOUNT_LEVERAGE > 0:
+            used = sum(p.notional for p in self.get_open_positions())
+            cap = config.FUTURES_MAX_ACCOUNT_LEVERAGE
+            # The new fill reduces net equity by entry AND estimated exit fee.
+            capacity = max(0.0, net_equity * cap - used) / (1 + 2 * cap * config.FUTURES_FEE_PCT)
+            margin_usd = min(margin_usd, capacity / self.leverage)
+        if config.RISK_MAX_OPEN_EXPOSURE_USD > 0:
+            used = sum(p.notional for p in self.get_open_positions())
+            margin_usd = min(margin_usd, max(0.0, config.RISK_MAX_OPEN_EXPOSURE_USD - used) / self.leverage)
+
+        max_margin_with_entry_fee = available / (1 + self.leverage * config.FUTURES_FEE_PCT)
         if margin_usd > max_margin_with_entry_fee:
             margin_usd = max_margin_with_entry_fee
-        if margin_usd < 10:
+        if not math.isfinite(margin_usd) or margin_usd < 10:
             logger.warning("Cash too low ($%.2f) — skipping %s", margin_usd, symbol)
             return None
 
         market_price = self.get_current_price(symbol)
-        if market_price is None:
-            logger.warning("Skipping %s — no Binance USDT price data available", symbol)
+        if market_price is None or not math.isfinite(market_price) or market_price <= 0:
+            logger.warning("Skipping %s — no fresh derivatives price available", symbol)
             return None
         price = market_price
 
@@ -977,6 +994,7 @@ class FuturesTrader:
         now = datetime.now(timezone.utc)
 
         open_positions = self.get_open_positions()
+        fresh_symbols = set()
         for pos in open_positions:
             if config.is_futures_excluded_symbol(pos.symbol):
                 pos.last_known_price = pos.entry_price
@@ -987,14 +1005,17 @@ class FuturesTrader:
                 price = self.get_current_price(pos.symbol)
             except Exception:
                 price = None
-            if price is None:
+            if price is None or not math.isfinite(price) or price <= 0:
                 continue
             pos.last_known_price = price
+            pos.mark_updated_at = now.isoformat()
+            fresh_symbols.add(pos.symbol)
 
         self.refresh_cross_liquidation_prices()
 
         account_equity, maintenance_margin = self._account_equity_and_maintenance(open_positions)
-        if open_positions and account_equity <= maintenance_margin:
+        all_fresh = all(p.symbol in fresh_symbols for p in self.get_open_positions())
+        if self.get_open_positions() and all_fresh and account_equity <= maintenance_margin:
             logger.warning(
                 "[PAPER-FUT] CROSS ACCOUNT LIQUIDATION | equity $%.2f <= maintenance $%.2f",
                 account_equity,
@@ -1013,6 +1034,8 @@ class FuturesTrader:
         for pos in open_positions:
             if pos.status != FuturesPositionStatus.OPEN:
                 continue
+            if pos.symbol not in fresh_symbols:
+                continue
             price = pos.last_known_price
             if price is None:
                 continue
@@ -1020,7 +1043,7 @@ class FuturesTrader:
             pos.tp_price = self._net_tp_price(pos, now)
 
             # Cross-margin liquidation safety check.
-            if self._is_downside_liquidation_trigger(pos, price):
+            if all_fresh and self._is_downside_liquidation_trigger(pos, price):
                 self._close(pos, price, FuturesPositionStatus.LIQUIDATED, now)
                 closed.append(pos)
                 continue
@@ -1059,15 +1082,14 @@ class FuturesTrader:
                 closed.append(pos)
                 continue
 
-            # Max hold — exit at market, top-50 coins rebound given time
+            # Expiry uses a fresh mark, never a cached stale fill.
             if (now - pos.entry_time) > timedelta(days=config.MAX_HOLD_DAYS):
                 self._close(pos, price, FuturesPositionStatus.EXPIRED, now)
                 closed.append(pos)
                 continue
 
-        if closed:
-            self.refresh_cross_liquidation_prices()
-            self._save_open_positions()
+        self.refresh_cross_liquidation_prices()
+        self._save_open_positions()
         return closed
 
     @staticmethod
@@ -1234,26 +1256,8 @@ class FuturesTrader:
                 loaded, past_pnl, self.cash_balance,
             )
 
-    def apply_monthly_contribution(self, now: datetime | None = None) -> float:
-        """Apply the configured monthly paper contribution once per month."""
-        self.cash_balance, amount = accounting.apply_monthly_contribution(self.cash_balance, now)
-        self._normalize_cash_balance()
-        if amount:
-            self.refresh_cross_liquidation_prices()
-            self._save_open_positions()
-            self._append_event(
-                event_type="CONTRIBUTION",
-                status="APPLIED",
-                amount=amount,
-                pnl=0.0,
-                balance=self.cash_balance,
-                symbol_or_route="USD",
-                details="monthly paper contribution",
-            )
-        return amount
-
     def get_contributed_capital(self) -> float:
-        return accounting.total_contributed_capital()
+        return self.account_capital_usd if self.account_capital_usd is not None else self.infer_starting_capital()
 
     @staticmethod
     def _entry_fee_for(pos: FuturesPosition) -> float:
@@ -1262,16 +1266,14 @@ class FuturesTrader:
 
     def infer_starting_capital(self) -> float:
         """Infer pre-metadata starting capital from the paper account ledger."""
-        state = accounting.load_account_state()
-        monthly_contributions = float(state.get("total_contributed_usd", 0.0))
         closed_pnl = sum(p.pnl_usd for p in self.get_trade_history())
-        entry_fees = sum(self._entry_fee_for(p) for p in self.positions)
+        entry_fees = sum(self._entry_fee_for(p) for p in self.get_open_positions())
         open_margin = sum(p.margin_used for p in self.get_open_positions())
-        return self.cash_balance - monthly_contributions - closed_pnl + entry_fees + open_margin
+        return self.cash_balance - closed_pnl + entry_fees + open_margin
 
     def starting_capital_delta(self, new_capital: float) -> float:
         new_capital = float(new_capital)
-        if new_capital <= 0:
+        if not math.isfinite(new_capital) or new_capital <= 0:
             raise ValueError("capital must be positive")
         current_capital = (
             self.account_capital_usd
@@ -1305,6 +1307,11 @@ class FuturesTrader:
         self.account_capital_usd = new_capital
         self.refresh_cross_liquidation_prices()
         self._save_open_positions()
+        self._append_event(
+            event_type="CAPITAL_ADJUSTMENT", status="APPLIED", amount=delta,
+            pnl=0.0, balance=self.cash_balance, symbol_or_route="USD",
+            details=f"total paper deposits set to ${new_capital:.2f}; profits retained",
+        )
         return delta
 
     def reset_paper_account(self, reason: str = "manual_reset") -> dict:
@@ -1342,7 +1349,7 @@ class FuturesTrader:
 
         self.positions = []
         self.account_capital_usd = config.CAPITAL_USD
-        self.cash_balance = accounting.total_contributed_capital()
+        self.cash_balance = self.account_capital_usd
         self._normalize_cash_balance()
         self._save_open_positions()
 
@@ -1418,13 +1425,15 @@ class FuturesTrader:
         self._normalize_cash_balance()
         open_pos = [p for p in self.positions if p.status == FuturesPositionStatus.OPEN]
         data = {
+            "capital_model": "total-deposit-v2",
+            "exchange": config.FUTURES_EXCHANGE,
             "cash_balance": self.cash_balance,
             "starting_capital_usd": (
                 self.account_capital_usd
                 if self.account_capital_usd is not None
                 else config.CAPITAL_USD
             ),
-            "total_contributed_capital": accounting.total_contributed_capital(),
+            "total_contributed_capital": self.get_contributed_capital(),
             "positions": [
                 {
                     "symbol":            p.symbol,
@@ -1445,26 +1454,37 @@ class FuturesTrader:
                     "net_tp_pct":        p.net_tp_pct,
                     "fee_rate":          p.fee_rate,
                     "funding_rate_daily": p.funding_rate_daily,
+                    "last_known_price": p.last_known_price,
+                    "mark_updated_at": p.mark_updated_at,
                 }
                 for p in open_pos
             ],
         }
         try:
-            with open(_open_positions_json(), "w", encoding="utf-8") as f:
+            temporary = _open_positions_json().with_suffix(".json.tmp")
+            with open(temporary, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            temporary.replace(_open_positions_json())
         except Exception:
             logger.exception("Failed to save open positions to disk")
+            raise
 
     def _load_open_positions(self) -> None:
         """Restore open positions and exact cash balance from disk on startup."""
         path = _open_positions_json()
+        self._saved_exchange = config.FUTURES_EXCHANGE
         if not path.exists():
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            self._saved_exchange = data.get("exchange", "binance")
             if data.get("starting_capital_usd") is not None:
                 self.account_capital_usd = float(data["starting_capital_usd"])
+                if data.get("capital_model") != "total-deposit-v2":
+                    self.account_capital_usd += float(accounting.load_account_state()["total_contributed_usd"])
             restored = 0
             for p in data.get("positions", []):
                 pos = FuturesPosition(
@@ -1487,6 +1507,8 @@ class FuturesTrader:
                     net_tp_pct=p.get("net_tp_pct", config.FUTURES_NET_TP_PCT),
                     fee_rate=p.get("fee_rate", config.FUTURES_FEE_PCT),
                     funding_rate_daily=p.get("funding_rate_daily", config.FUNDING_RATE_DAILY),
+                    last_known_price=p.get("last_known_price"),
+                    mark_updated_at=p.get("mark_updated_at"),
                 )
                 self.positions.append(pos)
                 restored += 1
@@ -1513,13 +1535,14 @@ class FuturesTrader:
                 self._save_open_positions()
         except Exception:
             logger.exception("Failed to load open positions from disk")
+            raise ValueError("Saved paper account cannot be restored; no trading or overwrite allowed") from None
 
     def _cash_balance_from_ledger(self) -> float:
         closed_pnl = sum(p.pnl_usd for p in self.get_trade_history())
         open_positions = self.get_open_positions()
         open_margin = sum(p.margin_used for p in open_positions)
         open_entry_fees = sum(self._entry_fee_for(p) for p in open_positions)
-        return accounting.total_contributed_capital() + closed_pnl - open_margin - open_entry_fees
+        return self.get_contributed_capital() + closed_pnl - open_margin - open_entry_fees
 
     def _reconcile_cash_balance_with_ledger(self) -> None:
         expected_cash = self._cash_balance_from_ledger()

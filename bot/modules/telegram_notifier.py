@@ -48,7 +48,6 @@ def dashboard_keyboard() -> dict:
     rows = [
         [
             {"text": "Futures Dashboard", "callback_data": "dashboard:futures"},
-            {"text": "P2P Arb", "callback_data": "dashboard:p2p"},
         ],
         [
             {"text": "Today P&L", "callback_data": "control:today"},
@@ -119,14 +118,11 @@ def default_info_text() -> str:
     return (
         "<b>TradingBot23 Telegram</b>\n"
         "/dashboard - live futures paper dashboard\n"
-        "/p2p - live USDT/PHP P2P assist snapshot\n"
-        "/today - today's closed P&L and P2P paper summary\n"
+        "/today - today's closed futures P&L\n"
         "/export - write a local operations report\n"
         "/info - automation scope and safety notes\n\n"
         + ("/pause or /resume - control the desktop paper loop\n\n" if config.TELEGRAM_ALLOW_CONTROL else "Remote pause/resume is disabled by default.\n\n")
-        + "P2P Paper Sim uses live listings and can send paper-event alerts. "
-        "P2P Live Assist can scan, score, alert, and log watch routes. "
-        "Fiat payment, payment-completed confirmation, and crypto release stay manual."
+        + "Futures are paper-only. OKX connectivity does not enable real-money orders."
     )
 
 

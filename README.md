@@ -1,348 +1,120 @@
 # TradingBot23
 
-**Automated crypto futures mean-reversion bot with a paper trading GUI, persistent trade history, Telegram alerts, and optional Ohverlay desktop bubbles.**
+Private-use, futures-only paper trading with OKX public USDT perpetual data,
+net performance reporting and a local control bridge for LUM/Desktop Commander.
+No live orders, fiat payments, withdrawals or transfers are implemented.
 
-Runs on Windows as a standalone EXE — no Python, no coding required for end users.
+## Windows Build
 
----
+The newest successful build is in GitHub **Actions > Build TradingBot23 App >
+Artifacts > TradingBot23-Windows**. Extract the ZIP and run `TradingBot23.exe`.
+Release downloads change only when a release is published, not on every push.
+First launch starts paused until Settings are confirmed. Keep your private
+`.env` and `data` folder outside GitHub; beta testers must start with their own.
 
-## What It Does
+## Current Workflow
 
-TradingBot23 selects a monthly loser basket from the configured top-50 market-cap universe, excluding stablecoins and unsupported futures symbols. Eligible dips must pass completed-candle rebound checks and risk guards before paper entry. A dip is not a guarantee of recovery or profit.
+| View | Purpose |
+| --- | --- |
+| Open | Entry leverage, margin, cached marks, estimated net P&L and cross liquidation |
+| Risk | Entry guards, notional limits, optional daily-loss/streak limits and decisions |
+| Charts | Session equity and closed-trade performance |
+| History | Net fills, expectancy, profit factor, exports and archived paper resets |
+| Ledger | Local audit of account operations, including preserved legacy events |
+| Settings | Total deposited capital, exchange, leverage, targets, sizing and launch controls |
 
-**Public market-data sources (availability and rate limits vary):**
-- [CoinGecko](https://coingecko.com) — market cap rankings and 24h price changes
-- [Binance public API](https://binance.com) — real-time prices for TP/SL monitoring
-- Binance P2P public search — read-only USDT/PHP buy/sell ads for arbitrage monitoring
+Binance P2P is retired from the active app, Telegram menu and automation.
+Existing P2P data is left unchanged. Legacy P2P calculation modules/tests remain
+offline for audit compatibility; a future P2P product will be separate.
 
----
+### Capital
 
-## Quick Start — Windows EXE (No Python needed)
+**Capital (USD)** is total deposited paper capital. It is not a new equity
+balance and no monthly contribution is added on top. Apply increases/decreases
+free cash by the deposit difference, preserving realized profit/loss and open
+positions. A withdrawal requiring more than free cash is rejected.
 
-1. For the latest pushed build, open [GitHub Actions](https://github.com/michaelfutol/tradingbot23/actions/workflows/build.yml), select the newest successful run, and download its `TradingBot23-Windows` artifact. Release assets update only when a release is published.
-2. Extract the artifact into its own folder. Do not copy another person's `.env`, `data`, or `logs`.
-3. Double-click `TradingBot23.exe` and complete the first-run setup. Read-only Binance keys are sufficient for paper trading; do not enable withdrawal permissions.
-4. Review Settings, apply them, and press Resume. New installs remain paused until settings are confirmed.
+Old monthly records are preserved in `account_state.json` as read-only evidence.
+On upgrade the old baseline is reconciled once against the configured total
+capital, with a capital-adjustment event, not rewritten as trading profit.
+**Reset Futures Paper** archives the old session and starts a clean one at the
+configured total capital. It requires confirmation and leaves scanning paused.
 
-The bot runs in **paper trading mode only**. It does not place real orders.
+### Strategy And Exposure
 
----
+The monthly candidate basket comes from the configured **top 50 market-cap**
+universe, excluding stablecoins and coins outside the fresh rank/volume guard.
+The selected exchange must have a usable derivatives instrument. Entries wait
+for a dip, validated completed 15m candles, rebound confirmation and BTC regime
+checks. No-data/stale-data candidates are rejected, not treated as an entry.
+The wave score is deterministic analysis, not a trained AI or win probability.
 
-## Dashboard
+The default total-notional cap is **3x estimated net account equity**, across
+all trades, and the default free-cash reserve is **20%**. These size/block new
+entries; they do not force-close positions. A 20x entry setting does not mean
+the whole account must carry 20x exposure. Set the cap to zero only deliberately
+for paper stress testing. Stop-loss and emergency crash stop remain opt-in.
+Cross liquidation is an approximate paper model, not OKX's tiered liquidation
+engine, and cash reserves do not guarantee safety during a crash.
 
-The app has a full GUI with these tabs. The summary shows estimated net equity and separates realized net profit from open net P&L, modeled exit fees, and funding.
+**Pause** stops new entries while continuing to check existing positions for
+exits. Exchange switching is blocked while positions are open. Saved marks are
+timestamped; failed refreshes cannot execute TP, SL or expiry at a stale mark.
 
-| Tab | What you see |
-|---|---|
-| **Open** | Open positions with entry price, cached current price, entry leverage, estimated net P&L%, TP, cross-liquidation estimate, age |
-| **Risk** | Entry guards, kill switch, exposure limits, and decision log |
-| **Charts** | Equity curve, trade return distribution, exit breakdown pie, cumulative P&L |
-| **History** | Current-session closed trades, net expectancy, profit factor, exports, and a reset that archives the old session |
-| **P2P Arb** | USDT/PHP P2P cycle command center with route sizing, net profit estimate, route grade, warnings, and journal |
-| **P2P History** | Paper cycles and hold transactions with their balance changes |
-| **Ledger** | Local operational and accounting events |
-| **Settings** | Change leverage, TP%, SL on/off, capital, monthly contribution, max hold days, and view the next 12 contribution markers |
+Net equity and trade P&L include modeled fees and funding. Their rates are
+configurable estimates, not your actual OKX fee tier or live funding accrual.
+Paper fills do not prove real execution, liquidity, slippage or profitability.
+Judge results using net expectancy, average win/loss, profit factor and open
+drawdown, not win rate alone. Validate changes out of sample and forward-test
+before considering a separate live-order integration.
 
----
+## OKX Connection
 
-## Strategy
+Set `FUTURES_EXCHANGE=okx` in Settings or the private `.env`. Public market data
+requires **no API key**. The connector validates active linear USDT swaps,
+fresh marks and completed candles. Binance public futures compatibility remains
+available for existing accounts, but there is no spot fallback.
 
-### Core Thesis
-
-The strategy tests mean reversion in liquid, higher-market-cap futures coins. Market-cap rank does not establish safety: coins can continue falling, fail, or never regain the entry price. Judge results by net expectancy, profit factor, drawdown and open losses, not only closed-trade win rate. Cross margin shares collateral; it does not make leveraged losses safe.
-
-### Rules
-
-| Parameter | Value | Description |
-|---|---|---|
-| Universe | Top 50 by market cap | Via CoinGecko free API, no key needed |
-| Basket | Top 5 worst 24h performers | Locked monthly, refreshed on the 1st |
-| Entry signal | Configured 24h dip plus rebound confirmation | Scanned every 5 minutes; a free slot alone does not trigger entry by default |
-| Take profit | +1% NET (after all fees) | Gross price target auto-computed |
-| Stop loss | Disabled by default | Optional; disabling it leaves expiry, funding and cross-account losses possible |
-| Liquidation guard | Always active | Uses cross-margin account equity so free cash backs every futures paper position |
-| Max hold | 3 days | Auto-close at market if TP not reached |
-| Position size | 20% of portfolio | Dynamic compounding — grows with your portfolio |
-| Engine | Futures 1x (default) | One-cycle paper entries/exits with futures fee and liquidation modeling |
-| Leverage | 1x–20x (paper configurable) | Higher settings are for paper stress testing only |
-
-### Execution Flow
-
-```
-1st of month ──► CoinGecko: fetch top 50 by market cap
-                      │
-                      ▼
-                 Rank by 24h % change (ascending)
-                      │
-                      ▼
-                 Lock top 5 losers as monthly basket
-                      │
-                      ▼
-              Every 5 minutes:
-                ├── Check open positions (TP / liquidation / expiry)
-                ├── Scan basket coins for the configured dip
-                ├── Validate fresh completed futures candles and rebound structure
-                └── Open eligible candidates only if risk and cooldown checks allow
+```powershell
+.\venv\Scripts\python.exe -m bot.okx_check
 ```
 
-### Entry and Risk Filters
+Optional read-only **demo** credential verification:
 
-- **Optional stop-loss handling** — hard stops and emergency crash stops are opt-in; cross margin does not guarantee protection from account losses.
-- **Loss cooldown** — after a stop hit on a coin, that coin is blocked for 24 hours to avoid stacking losses on a falling knife.
-- **TP cooldown** — after a TP hit on a coin, waits 1 hour before re-entering the same coin (prevents scalping the same coin in a loop).
-- **Dip required by default** — empty slots wait for an eligible dip rather than automatically staying invested.
-- **Rebound confirmation** — two rising completed 15m closes, positive 1h momentum and a close above SMA20. Missing or stale analysis blocks entry.
-- **Cost-aware reporting** — open net P&L estimates include original entry/exit fee assumptions and modeled funding. These estimates are not exchange-exact live balances.
-
----
-
-## Architecture
-
-```
-tradingbot23/
-├── bot/
-│   ├── config.py                  # All settings loaded from .env
-│   ├── dashboard.py               # Tkinter GUI — Open, Charts, History, P2P Arb, Settings
-│   ├── setup_wizard.py            # First-run GUI wizard
-│   ├── main.py                    # Entry point
-│   └── modules/
-│       ├── data_fetcher.py        # CoinGecko API — rankings, 24h changes, snapshots
-│       ├── futures_trader.py      # Paper futures engine with leverage, funding, liquidation
-│       ├── p2p_arbitrage.py       # P2P route sizing, scoring, and manual cycle journal
-│       ├── p2p_monitor.py         # Read-only Binance P2P USDT/PHP spread monitor
-│       ├── strategy.py            # Basket logic, dip detection, fill_empty_slots
-│       ├── telegram_notifier.py   # Trade alerts via Telegram bot
-│       ├── ohverlay_notifier.py   # Optional localhost Ohverlay bubble bridge
-│       └── backtester.py          # Historical simulation using Binance klines
-├── data/                          # Monthly snapshots (JSON) + trade_history.csv
-├── logs/                          # Daily log files
-├── .env.example                   # Configuration template
-├── tradingbot23.spec              # PyInstaller spec for Windows EXE build
-└── README.md
+```ini
+OKX_API_KEY=
+OKX_API_SECRET=
+OKX_API_PASSPHRASE=
 ```
 
----
+```powershell
+.\venv\Scripts\python.exe -m bot.okx_check --demo
+```
 
-## Configuration
+Use demo keys with read permission, never withdrawal permission. The private
+verification request is always marked `x-simulated-trading: 1`. This is not
+demo order execution and does not enable live trading. See the
+[official OKX API guide](https://www.okx.com/docs-v5/en/).
 
-All settings live in `.env`. The Settings tab in the GUI lets you change most of these at runtime without restarting.
+## LUM Control Bridge
 
-### Core Settings
+See [LUM_BRIDGE.md](docs/LUM_BRIDGE.md) for Desktop Commander commands and limits.
+The bridge belongs to the running desktop bot, binds only to `127.0.0.1`,
+requires a rotating private token and publishes cached account snapshots.
+One data directory can have only one GUI/CLI/API writer. Do not start another
+bot to control the same account.
 
-| Variable | Default | Description |
-|---|---|---|
-| `BINANCE_API_KEY` | — | Binance API key (read-only for paper mode) |
-| `BINANCE_API_SECRET` | — | Binance API secret |
-| `TRADING_MODE` | `paper` | Futures are paper-only; no live execution path is implemented |
-| `ENGINE` | `futures` | Futures-only; spot trading is intentionally disabled |
-| `CAPITAL_USD` | `500` | Starting paper capital in USD |
-| `LEVERAGE` | `1` | 1x–20x paper setting. 1x is the lowest-risk futures setting |
-| `TOP_N_COINS` | `50` | Market cap universe (top 50 recommended) |
-| `TOP_N_LOSERS` | `5` | Monthly loser basket size; automatically expands if `MAX_OPEN_TRADES` is higher |
-| `MAX_OPEN_TRADES` | `5` | Max simultaneous futures paper positions, capped at 1–10 |
-| `PER_TRADE_PCT` | `0.20` | 20% of portfolio per trade |
-| `MONTHLY_CONTRIBUTION_USD` | `0` | Paper cash added once per month; set `100` to simulate adding $100/month |
-| `MONTHLY_CONTRIBUTION_DAY` | `1` | Day of month to apply the paper contribution |
+## Development
 
-### Profit / Risk Settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `FUTURES_NET_TP_PCT` | `0.01` | 1% net profit target after fees |
-| `FUTURES_NET_SL_PCT` | `0.015` | 1.5% net SL reference (only used if SL enabled) |
-| `FUTURES_USE_SL` | `false` | Enable hard stop-loss (disabled by default) |
-| `MAX_HOLD_DAYS` | `3` | Auto-close after N days |
-| `DIP_THRESHOLD_PCT` | `0.02` | Entry trigger: −2% 24h change |
-| `CRASH_ENTRY_GUARD_ENABLED` | `true` | Block new futures entries during a BTC crash |
-| `CRASH_EMERGENCY_SL_ENABLED` | `false` | Arm emergency crash SL on existing positions; this behaves like an SL |
-| `CRASH_BTC_TRIGGER_PCT` | `-0.04` | BTC 24h move that activates the crash entry guard |
-| `CRASH_BTC_RECOVERY_PCT` | `-0.02` | BTC 24h recovery level required before crash mode lifts |
-| `CRASH_SL_PCT` | `0.015` | Emergency crash SL distance below current price |
-| `AUTO_START_FUTURES` | `false` | New installs open paused so futures paper trades do not auto-open until Resume is pressed |
-| `SETTINGS_CONFIRMED` | `false` | First-run guard; app opens Settings first until Apply Settings is clicked |
-| `BREAK_EVEN_TRIGGER_PCT` | `0.005` | Slide SL to break-even after +0.5% move |
-| `LOSS_COOLDOWN_HOURS` | `24` | Hours to skip a coin after SL hit |
-| `TP_COOLDOWN_HOURS` | `1` | Hours to skip a coin after TP hit |
-| `PRE_TRADE_ANALYSIS_ENABLED` | `true` | Analyze Binance 15m candles before opening a futures trade |
-| `FUTURES_REQUIRE_DIP` | `true` | Empty slots still require the configured dip threshold |
-| `PRE_TRADE_CONFIRMATION_ENABLED` | `true` | Require completed-candle rebound confirmation before entry |
-| `PRE_TRADE_MIN_SCORE` | `60` | Minimum 0-100 wave score required before entry |
-| `PRE_TRADE_MIN_REBOUND_PCT` | `0.35` | Required bounce from the 24h low to avoid fresh-low entries |
-| `PRE_TRADE_MAX_1H_DROP_PCT` | `0.75` | Blocks entry if the last 1h move is still dropping too hard |
-| `PRE_TRADE_MIN_24H_RANGE_PCT` | `1.20` | Blocks low-range coins that do not have enough movement for the paper TP |
-| `PRE_TRADE_BREAKDOWN_GUARD_ENABLED` | `true` | Blocks continuous breakdown structures before a dip can become an entry |
-| `PRE_TRADE_MAX_24H_DROP_PCT` | `8.0` | Breakdown guard threshold for deep 24h drops |
-| `PRE_TRADE_MAX_LOWER_CLOSE_STREAK` | `5` | Blocks repeated lower 15m closes, a falling-knife pattern |
-| `PRE_TRADE_MAX_BELOW_SMA20_PCT` | `1.5` | Blocks coins too far below a falling 20-candle average |
-| `BTC_REGIME_FILTER_PCT` | `-0.015` | Blocks new long entries when BTC is down 1.5% or worse over roughly 1 hour; set `none` to disable |
-| `PAPER_SYMBOL_GUARD_ENABLED` | `true` | Uses local paper history to quarantine symbols with recent large realized losses |
-| `PAPER_SYMBOL_GUARD_MAX_REALIZED_LOSS_USD` | `50` | Blocks a symbol if recent realized P&L is below this loss |
-| `PAPER_SYMBOL_GUARD_BLOCK_LIQUIDATED` | `true` | Blocks a symbol after a recent paper liquidation |
-
-### Telegram Alerts (Optional)
-
-| Variable | Description |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | From @BotFather on Telegram |
-| `TELEGRAM_CHAT_ID` | Your chat ID (get it from @userinfobot) |
-
-**Setup:**
-1. Message @BotFather → `/newbot` → copy the token
-2. Message @userinfobot → copy your ID
-3. Paste both into `.env` — alerts activate immediately on next restart
-
-**You'll receive alerts and dashboard controls for:**
-- Every trade opened (coin, entry price, margin, leverage)
-- Every trade closed (exit price, net P&L, portfolio value)
-- Daily summary at midnight UTC
-- `/dashboard` or the **Futures Dashboard** button for live portfolio figures
-- `/p2p` or the **P2P Arb** button for live USDT/PHP route and paper ledger figures
-- `/info` for the automation scope and manual P2P safety notes
-
-### Ohverlay Bubble Alerts (Optional)
-
-TradingBot23 can send short local notifications to Ohverlay v4 fish/bubble overlays. This uses only Ohverlay's localhost webhook; no exchange keys, Telegram tokens, or live-trading controls are sent.
-
-| Variable | Default | Description |
-|---|---|---|
-| `OHVERLAY_ENABLED` | `false` | Enable TradingBot23 to Ohverlay bubble alerts |
-| `OHVERLAY_WEBHOOK_URL` | `http://127.0.0.1:7277/message` | Local Ohverlay webhook endpoint |
-| `OHVERLAY_SENDER` | `TradingBot23` | Sender label shown by Ohverlay |
-| `OHVERLAY_MAX_CHARS` | `420` | Max bubble message length |
-
-**Setup:**
-1. Open Ohverlay v4.
-2. From the Ohverlay tray menu, enable **Webhook Server**.
-3. In TradingBot23 Settings, enable **Ohverlay alerts**, click **Apply Settings**, then click **Test**.
-
----
-
-## Persistent Trade History
-
-Every closed trade is appended to `data/trade_history.csv`. This file:
-- Survives app restarts
-- Is loaded on startup so stats (win rate, total P&L) are always correct
-- Can be opened in Excel for analysis
-- Is the data source for the History tab in the GUI
-- Can be summarized from the History tab with **Export Report**
-
-CSV columns: `open_time, close_time, symbol, engine, entry_price, exit_price, amount_usd, notional, leverage, pnl_pct, pnl_usd, funding_paid, reason, entry_change_24h`
-
-Monthly paper contributions are tracked in `data/account_state.json` so restarts do not double-add the same month. The Settings tab shows a 12-month contribution schedule with paid/due/scheduled markers. Dashboard portfolio P&L uses total contributed capital, not only starting capital, so deposits are not counted as profit.
-
-Changing `Capital (USD)` in Settings now syncs the active paper account: increases add free paper cash immediately, decreases withdraw from free cash only, and existing open trades keep their original margin/leverage.
-
----
-
-## Futures Engine
-
-TradingBot23 is futures-only by design. Spot support was removed because spot/OCO execution needs separate exchange cycles to complete a turnabout, while this app focuses on one-cycle futures-style paper entries and exits.
-
-| Control | Detail |
-|---|---|
-| Execution | Paper-only futures simulation |
-| Leverage | 1x–20x (default 1x, paper-only) |
-| Fees | 0.06% per side on notional |
-| Funding cost | ~0.03%/day modeled |
-| Liquidation | Tracked; unsafe entries are refused |
-| Real orders | Not implemented |
-
----
-
-## P2P Arb And History
-
-The **P2P Arb** tab uses live Binance P2P USDT/PHP listings for both paper simulation and live monitoring. It pulls ads once when opened, then refreshes every 60 seconds while the tab is selected. The **P2P History** tab shows the paper transaction ledger and watch-route journal.
-
-P2P controls are durable. When valid P2P settings are used for refresh, recalculate, or paper actions, the app saves the current capital, min net %, transfer fee, buffer, delay, cancel %, decay %, mode, and automation toggles to `.env`, so refreshes and restarts keep the same control values.
-
-| Field | Detail |
-|---|---|
-| Best Buy USDT | Lowest seller price to buy USDT with PHP |
-| Best Sell USDT | Highest buyer price to sell USDT for PHP |
-| Route Calculator | Pairs buy/sell ads, caps size by capital and ad limits, and estimates net PHP profit |
-| 500K Sweep | Simulates splitting a PHP amount across multiple real buy/sell listings with weighted average prices |
-| Paper Arb | Compounds a local paper PHP balance from profitable live-listing depth sweeps; stored in `data/p2p_paper_arb.json` |
-| Paper Hold | Buys paper USDT now, keeps one open inventory position, and auto-sells when the configured net profit threshold is reached |
-| Live Assist | Can alert Telegram/Ohverlay and auto-log watchlist routes without changing the paper balance |
-| Route Grade | A/B/C/WATCH/REVIEW label based on estimated return and counterparty filters |
-| Journal | Logs the top route to `data/p2p_cycle_journal.csv` for manual cycle tracking |
-| Transaction History | Records reset, capital adjustment, paper cycle, hold buy, and hold sell rows in `data/p2p_transaction_history.csv` |
-| Tables | Top buy/sell ads with PHP limits, USDT available, payment methods, advertiser, finish rate, and order count |
-
-The route and paper-hold estimates are informational only. The app does not place P2P orders, send fiat, mark payment complete, verify fiat receipt, release crypto, or handle disputes. Manual fiat verification is required before releasing crypto or treating any real cycle as complete.
-
-### P2P Modes
-
-| Mode | Action | What Changes |
-|---|---|---|
-| Paper Sim (Live Data) | Paper Buy+Sell | Simulates buy and sell from the same live listing snapshot. If net profit meets the threshold, PHP profit is added immediately and no USDT remains open. |
-| Paper Sim (Live Data) | Paper Buy Hold | Simulates buying USDT from current live seller ads. Paper cash goes down, hold USDT appears, and the app waits for a later sell-side quote. |
-| Paper Sim (Live Data) | Check/Sell Hold | Marks the open paper hold against current live buyer prices. It closes only when the configured net profit threshold is reached. |
-| Paper Sim (Live Data) | TG Alerts | Sends paper buy/sell/hold events to enabled alert channels. |
-| Paper Sim (Live Data) | Recalculate Only | Refreshes route math only. It never records a paper transaction. |
-| Paper Sim (Live Data) | Auto Cycle | Runs only after fresh P2P listing refreshes and skips repeated fills when the listing set is unchanged. |
-| Live Assist | Send Live Snapshot | Sends the current P2P dashboard to Telegram. No balances change. |
-| Live Assist | Log Watch Route | Saves the current top route to `data/p2p_cycle_journal.csv`. No balances change. |
-
-Use **Paper Sim (Live Data)** to test compounding behavior against real listings without placing orders. Use **Live Assist** when watching real listings and manually executing outside the app.
-
----
-
-## Building the EXE (Developers)
-
-```bash
-git clone https://github.com/ikel-eidra/tradingbot23.git
-cd tradingbot23
+```powershell
 python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-pyinstaller tradingbot23.spec --clean
+.\venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\venv\Scripts\python.exe -m pytest -q
+.\venv\Scripts\python.exe -m bot.main --dashboard
+.\venv\Scripts\python.exe -m PyInstaller tradingbot23.spec --clean
 ```
 
-The EXE appears in `dist/TradingBot23.exe`. Copy the entire `dist/` folder to share — the `.env` file must travel with the EXE.
-
----
-
-## Risk Management
-
-| Control | Detail |
-|---|---|
-| Paper mode only | No real orders are placed; live futures execution is not implemented |
-| 1x leverage default | Lowest-risk futures setting with wide liquidation distance |
-| Cross-margin liquidation | Free cash plus open-position equity backs all paper futures positions, so small 20x paper trades are not treated like isolated-margin positions |
-| Liquidation guard | At any leverage, refuses new trades where the SL would breach the cross-liquidation price |
-| One position per coin | Duplicate entries blocked at trader level |
-| Cash safety check | Position size capped at available cash |
-| Dynamic sizing | Losses reduce exposure automatically; gains increase it |
-| Stablecoin filter | USDT, USDC, USDE, USD1, DAI, BUSD and others excluded from basket |
-| Max hold enforcement | Stale positions auto-closed after configured holding period |
-| TP/Loss cooldowns | Prevents re-entering a coin immediately after a win or loss |
-
----
-
-## Backtest Results (12-month simulation, May 2025 – May 2026)
-
-Backtested on real Binance kline data using the same strategy logic:
-
-| Metric | Result |
-|---|---|
-| Starting capital | $10,000 |
-| Final portfolio | ~$18,080 |
-| Total return | **+80.8%** |
-| Win rate | **77.3%** |
-| Engine | Futures 1x |
-| TP / SL | 1% net / 1.5% net |
-
-> Past results do not guarantee future performance.
-
----
-
-## Disclaimer
-
-This software is provided for **educational and research purposes only**. Cryptocurrency trading carries substantial financial risk. The authors accept no liability for financial losses. Always start with paper trading. Never allocate capital you cannot afford to lose.
-
----
-
-## License
-
-MIT
+Use `.env.example` as the configuration reference. The web draft uses a separate
+private account directory with authenticated access, not the desktop bridge.
+Public hosting is not configured. Historical backtests do not validate the new
+OKX paper workflow; do not interpret them as a promise of future returns.

@@ -56,8 +56,8 @@ export default function LandingPage() {
           </div>
           <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
             <Activity size={40} color="var(--warning)" />
-            <h3>Live Arbitrage</h3>
-            <p style={{ color: 'var(--text-muted)' }}>Real-time USDT/PHP P2P route sizing and spread monitor.</p>
+            <h3>OKX Paper Futures</h3>
+            <p style={{ color: 'var(--text-muted)' }}>OKX perpetual market data and private desktop paper controls.</p>
           </div>
         </div>
       </main>

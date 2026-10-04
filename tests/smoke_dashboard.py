@@ -18,7 +18,7 @@ def run():
         config.DATA_DIR = Path(tmp)
         config.PROJECT_ROOT = Path(tmp)
         config.CAPITAL_USD = 500
-        config.MONTHLY_CONTRIBUTION_USD = 0
+        config.LOCAL_BRIDGE_ENABLED = False
         config.AUTO_START_FUTURES = False
         config.SETTINGS_CONFIRMED = True
         config.TELEGRAM_BOT_TOKEN = ""
@@ -26,8 +26,7 @@ def run():
         config.OHVERLAY_ENABLED = False
         with (patch.object(Dashboard, "_start_trading_loop"),
               patch.object(Dashboard, "_start_telegram_dashboard"),
-              patch.object(Dashboard, "_schedule_refresh"),
-              patch.object(Dashboard, "_refresh_p2p")):
+              patch.object(Dashboard, "_schedule_refresh")):
             app = Dashboard(Strategy(trader=FuturesTrader()))
             try:
                 for size in ("1100x720", "1280x840"):
@@ -39,6 +38,10 @@ def run():
                     assert "Open net est." in app.profit_breakdown_var.get()
                     assert app._s_require_dip.get()
                     assert app._s_confirm_rebound.get()
+                    tabs = [app.notebook.tab(t, "text").strip() for t in app.notebook.tabs()]
+                    assert not any("P2P" in label for label in tabs)
+                    assert not hasattr(app, "contrib_tree")
+                    assert not hasattr(app, "p2p_monitor")
                     parent = app.settings_tab
                     canvas = next(w for w in parent.winfo_children() if w.winfo_class() == "Canvas")
                     canvas.yview_moveto(1)

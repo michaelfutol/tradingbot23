@@ -1,6 +1,8 @@
 """Live dashboard for TradingBot23."""
 
 import logging
+import math
+import queue
 import threading
 import time
 import tkinter as tk
@@ -19,24 +21,11 @@ import csv as _csv
 
 from bot import config
 import rebound_duration_analysis as rebound_analysis
-from bot.modules import accounting
+from bot.modules.local_bridge import LocalBridge
 from bot.modules import ohverlay_notifier as ov
 from bot.modules import telegram_notifier as tg
 from bot.modules.event_ledger import EventLedger, append_event
 from bot.modules.futures_trader import _history_csv, recent_reset_sessions
-from bot.modules.p2p_arbitrage import (
-    P2PDepthSweep,
-    P2PJournal,
-    P2PPaperArb,
-    P2PRealismSettings,
-    P2PRoute,
-    P2PRouteSettings,
-    apply_realism_to_sweep,
-    build_depth_sweep,
-    build_p2p_routes,
-    build_p2p_hold_entry,
-)
-from bot.modules.p2p_monitor import P2PMonitor, P2PSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +95,10 @@ class ToolTip:
 
 
 SETTINGS_HELP = {
-    "Capital (USD)": "Starting paper capital for futures. Increasing adds free paper cash. Decreasing withdraws from free cash only; open trades keep their original margin.",
+    "Capital (USD)": "Total paper deposits, not a fresh balance or a base plus monthly additions. Apply adds or withdraws the difference from free cash; trading profits/losses and open positions are retained. Use Reset Futures Paper for a fresh session.",
+    "Account exposure (x)": "Maximum TOTAL leveraged notional divided by estimated net equity. 3x means a $100 account can hold at most $300 total notional, even with 20x entries. Zero disables this cap. It blocks/sizes new entries, never force-closes trades.",
+    "Cash reserve (%)": "Minimum share of net equity retained as free cross-margin cash. This reduces exposure but cannot prevent liquidation in a severe crash.",
+    "Futures exchange": "OKX uses live public linear USDT perpetual marks and completed candles; no API key is needed for paper. Binance is retained for compatibility. Change only with no open positions.",
     "Leverage": "Leverage used for new futures paper trades only. Higher leverage magnifies both profit and drawdown. Existing trades keep their entry leverage.",
     "TP target (% net)": "Net take-profit target on margin after estimated fees and funding. The app calculates the required price move for each new trade.",
     "Stop Loss": "Optional hard stop-loss. When disabled, positions rely on TP, max-hold expiry, and cross-margin liquidation tracking.",
@@ -119,8 +111,6 @@ SETTINGS_HELP = {
     "Min pre-trade score": "Minimum 0-100 wave score required before entry. Higher is stricter and opens fewer trades.",
     "Require dip": "When enabled, empty slots wait until the configured 24h dip threshold is met. Disable only to restore the old always-invested refill policy.",
     "Confirm rebound": "Requires two rising completed 15m closes, positive 1h momentum and a close above SMA20. This is a quality filter, not a prediction or a guaranteed win rate.",
-    "Monthly contribution ($)": "Paper cash to add once per month for contribution/compounding simulation.",
-    "Contribution day": "Calendar day of month when the paper contribution is applied. If the month is shorter, the app uses the last valid day.",
     "Auto-start futures": "When enabled, futures scanning resumes automatically on app launch after settings are confirmed.",
     "Ohverlay alerts": "Send short local bubble notifications to Ohverlay v4 via localhost webhook. Requires Ohverlay's Webhook Server to be enabled.",
 }
@@ -130,38 +120,12 @@ RISK_HELP = {
     "Max daily loss $": "Risk guard. Zero disables it. If today's closed futures P&L falls below this loss, new entries are blocked.",
     "Max open notional $": "Risk guard. Zero disables it. Blocks new entries once leveraged open notional reaches this dollar limit.",
     "Max loss streak": "Risk guard. Zero disables it. Blocks new entries after this many consecutive losing closed futures trades.",
-    "P2P max route PHP": "Per-cycle cap for P2P paper/live-assist route sizing. Zero means use the capital value from the P2P tab.",
-    "P2P delay min": "Assumed manual P2P settlement time. It adds a small realism haircut and also acts as Auto Cycle cooldown.",
-    "P2P cancel %": "Simulated failed/cancelled P2P order rate. It deducts a small expected cost from paper route profit.",
-    "P2P decay %": "Spread-fade haircut. Example: 0.05% on 500,000 PHP deducts 250 PHP from expected route profit.",
 }
 
-P2P_FIELD_HELP = {
-    "Capital PHP": "Paper capital or route size basis for USDT/PHP P2P calculations. Paper mode compounds realized profit into this account.",
-    "Min net %": "Minimum net profit percent required after buffer, transfer fee, delay, cancel, and decay haircuts.",
-    "Xfer fee USDT": "Simulated crypto transfer/network fee when buying and selling across different marketplaces.",
-    "Buffer PHP": "Fixed peso safety cost deducted from every route. Use this for hidden fees, payment friction, or manual execution error.",
-    "Delay min": "Assumed time to complete the manual P2P cycle. It adds realism drag and sets Auto Cycle cooldown.",
-    "Cancel %": "Expected cancelled/failed order rate. Higher values make paper results more conservative.",
-    "Decay %": "Spread-fade haircut. It models the chance that the buy/sell spread shrinks while you execute manually.",
-}
-
-P2P_SUMMARY_HELP = {
-    "BEST BUY USDT": "Lowest seller price available to buy USDT using PHP from the loaded P2P listings.",
-    "BEST SELL USDT": "Highest buyer price available to sell USDT for PHP from the loaded P2P listings.",
-    "TOP NET PROFIT": "Best single route profit after configured costs and realism haircuts.",
-    "DEPTH SWEEP": "Estimated result if the app tries to use the full configured capital across available order depth.",
-    "PAPER BAL": "Total P2P paper equity: free PHP cash plus any open hold inventory at cost.",
-    "CYCLES": "Completed paper buy+sell cycles and realized PHP profit from those cycles.",
-    "HOLD USDT": "Paper USDT inventory currently held from Paper Buy Hold.",
-    "HOLD P&L": "Estimated mark-to-market profit/loss if the held USDT were sold into current buyer listings.",
-}
 
 
 class Dashboard:
     REFRESH_MS = 2000
-    P2P_REFRESH_SECS = 60
-    P2P_ALERT_COOLDOWN_SECS = 300
 
     def __init__(self, strategy):
         self.strategy = strategy
@@ -171,26 +135,15 @@ class Dashboard:
         self._paused       = (not config.AUTO_START_FUTURES) or (not self._settings_confirmed)
         self._force_event  = threading.Event()
         self._cycle_thread = None
+        self._account_lock = threading.RLock()
+        self._one_shot_requested = False
+        self._bridge = None
+        self._bridge_scan_id = None
 
         self._last_cycle_time:    datetime | None = None
         self._last_cycle_summary: dict = {}
         self._next_cycle_ts:      float = 0.0
-        self.p2p_monitor = P2PMonitor(asset="USDT", fiat="PHP")
-        self.p2p_journal = P2PJournal()
-        self.p2p_paper = P2PPaperArb()
         self.event_ledger = EventLedger()
-        self._p2p_refreshing = False
-        self._p2p_last_snapshot: P2PSnapshot | None = None
-        self._p2p_routes: list[P2PRoute] = []
-        self._p2p_sweep: P2PDepthSweep | None = None
-        self._p2p_next_refresh_ts = 0.0
-        self._p2p_settings_cache = P2PRouteSettings()
-        self._p2p_last_alert_key = ""
-        self._p2p_last_alert_ts = 0.0
-        self._p2p_last_logged_route_key = ""
-        self._p2p_last_auto_cycle_key = ""
-        self._p2p_last_auto_cycle_ts = 0.0
-        self._p2p_last_saved_controls: dict[str, str] = {}
         self._telegram_commands = None
         self._risk_kill_switch = False
         self._decision_log: list[dict[str, str]] = []
@@ -216,6 +169,7 @@ class Dashboard:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
+        self._start_local_bridge()
         self._start_telegram_dashboard()
         self._start_trading_loop()
         self._schedule_refresh()
@@ -387,8 +341,6 @@ class Dashboard:
         risk_tab     = tk.Frame(nb, bg="#0d1117")
         charts_tab   = tk.Frame(nb, bg="#0d1117")
         history_tab  = tk.Frame(nb, bg="#0d1117")
-        p2p_tab      = tk.Frame(nb, bg="#0d1117")
-        p2p_history_tab = tk.Frame(nb, bg="#0d1117")
         ledger_tab   = tk.Frame(nb, bg="#0d1117")
         settings_tab = tk.Frame(nb, bg="#0d1117")
         self.settings_tab = settings_tab
@@ -396,8 +348,6 @@ class Dashboard:
         nb.add(risk_tab,     text="  Risk  ")
         nb.add(charts_tab,   text="  Charts  ")
         nb.add(history_tab,  text="  History  ")
-        nb.add(p2p_tab,      text="  P2P Arb  ")
-        nb.add(p2p_history_tab, text="  P2P History  ")
         nb.add(ledger_tab,   text="  Ledger  ")
         nb.add(settings_tab, text="  Settings  ")
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -406,8 +356,6 @@ class Dashboard:
         self._build_risk_tab(risk_tab)
         self._build_charts_tab(charts_tab)
         self._build_history_tab(history_tab)
-        self._build_p2p_tab(p2p_tab)
-        self._build_p2p_history_tab(p2p_history_tab)
         self._build_ledger_tab(ledger_tab)
         self._build_settings_tab(settings_tab)
         if not self._settings_confirmed:
@@ -427,7 +375,7 @@ class Dashboard:
     def _start_telegram_dashboard(self):
         self._telegram_commands = tg.TelegramDashboardPoller(
             futures_callback=self._telegram_futures_snapshot,
-            p2p_callback=self._telegram_p2p_snapshot,
+            p2p_callback=lambda: "P2P is retired from this app. Existing audit files are preserved locally.",
             info_callback=self._telegram_info_text,
             control_callback=self._telegram_control,
         )
@@ -484,32 +432,13 @@ class Dashboard:
                 lines.append(f"+{len(open_positions) - 6} more open position(s)")
         return "\n".join(lines)
 
-    def _telegram_p2p_snapshot(self) -> str:
-        settings = self._p2p_settings_cache
-        stale_note = ""
-        try:
-            snapshot = self.p2p_monitor.fetch_snapshot(rows=20)
-        except Exception as exc:
-            if not self._p2p_last_snapshot:
-                raise
-            snapshot = self._p2p_last_snapshot
-            stale_note = f"\nUsing last UI snapshot; live refresh failed: {tg.escape_html(exc)}"
-
-        scan_settings = self._p2p_capped_route_settings(settings)
-        routes = build_p2p_routes([snapshot], settings=scan_settings)
-        raw_sweep = build_depth_sweep([snapshot], settings=scan_settings)
-        sweep = self._apply_p2p_realism(raw_sweep) if raw_sweep else None
-        state = self.p2p_paper.state(settings.capital_php)
-        return self._format_p2p_dashboard_text(snapshot, routes, sweep, state, settings) + stale_note
 
     def _telegram_info_text(self) -> str:
         return (
-            "<b>TradingBot23 Live Assist Scope</b>\n"
+            "<b>TradingBot23 Futures Paper</b>\n"
             "Futures: paper portfolio, open positions, trade stats, and daily summary alerts.\n"
-            "P2P Paper Sim: uses live Binance listings, updates paper ledger, and can send Telegram paper-event alerts.\n"
-            "P2P Live Assist: scan, spread score, Telegram alert, and watchlist log only.\n\n"
-            "Manual in real P2P: choose counterparty, send fiat, confirm payment, verify receipt, release crypto, and handle disputes.\n"
-            "Commands: /dashboard, /p2p, /today, /export, /info"
+            "OKX public prices or Binance compatibility. No real-money orders.\n"
+            "Commands: /dashboard, /today, /export, /info"
             + ("\nRemote pause/resume is enabled." if config.TELEGRAM_ALLOW_CONTROL else "\nRemote pause/resume is disabled by default.")
         )
 
@@ -527,7 +456,7 @@ class Dashboard:
             )
             return (
                 "<b>Remote futures controls are disabled.</b>\n"
-                "Telegram can still show dashboard, P2P, today, info, and export snapshots."
+                "Telegram can still show dashboard, today, info, and export snapshots."
             )
         if action == "pause":
             self._paused = True
@@ -564,7 +493,6 @@ class Dashboard:
 
     def _telegram_today_text(self) -> str:
         snap = self._risk_snapshot()
-        p2p_state = self.p2p_paper.state(self._p2p_starting_capital_php())
         allowed, reasons = self._risk_allows_trading()
         return "\n".join([
             "📅 <b>TradingBot23 Today</b>",
@@ -572,70 +500,9 @@ class Dashboard:
             f"Futures daily closed P&L: <b>${snap['daily_pnl']:+,.2f}</b>",
             f"Portfolio: <b>${snap['portfolio']:,.2f}</b> | Cash: <b>${snap['cash']:,.2f}</b>",
             f"Open futures notional: <b>${snap['open_notional']:,.2f}</b>",
-            f"P2P paper: <b>{self._num(p2p_state.get('balance_php')):,.0f} PHP</b> "
-            f"({self._num(p2p_state.get('realized_profit_php')):+,.0f} realized)",
             f"Risk note: {tg.escape_html('; '.join(reasons) if reasons else 'limits clear')}",
         ])
 
-    def _format_p2p_dashboard_text(
-        self,
-        snapshot: P2PSnapshot,
-        routes: list[P2PRoute],
-        sweep: P2PDepthSweep | None,
-        state: dict,
-        settings: P2PRouteSettings,
-    ) -> str:
-        best_buy = snapshot.best_buy
-        best_sell = snapshot.best_sell
-        as_of = snapshot.as_of.strftime("%Y-%m-%d %H:%M:%S UTC") if snapshot.as_of else "unknown"
-        balance = self._num(state.get("balance_php"))
-        cash = self._num(state.get("cash_php"), balance)
-        realized = self._num(state.get("realized_profit_php"))
-        hold = state.get("hold_position") or {}
-        lines = [
-            "📊 <b>TradingBot23 P2P Arb</b>",
-            f"USDT/PHP updated: {as_of}",
-            f"Capital: <b>{settings.capital_php:,.0f} PHP</b>  |  Min net: <b>{settings.min_profit_pct:.3f}%</b>",
-            f"Paper balance: <b>{balance:,.0f} PHP</b>  |  Cash: <b>{cash:,.0f} PHP</b>  |  Realized: <b>{realized:+,.0f} PHP</b>",
-        ]
-        if best_buy and best_sell:
-            lines.append(
-                f"Best buy: <b>{best_buy.price:,.2f}</b> | "
-                f"Best sell: <b>{best_sell.price:,.2f}</b> | "
-                f"Raw spread: <b>{(snapshot.spread or 0):+.2f}</b> PHP"
-            )
-        if sweep:
-            warnings = "; ".join(sweep.warnings) if sweep.warnings else "ok"
-            lines.extend([
-                "",
-                "<b>Depth sweep</b>",
-                f"Size: {sweep.size_php:,.0f} PHP",
-                f"Avg buy/sell: {sweep.avg_buy_price:,.2f} / {sweep.avg_sell_price:,.2f}",
-                f"Net: <b>{sweep.profit_php:+,.0f} PHP ({sweep.profit_pct:+.3f}%)</b> | Grade {sweep.grade}",
-                f"Warnings: {tg.escape_html(warnings)}",
-            ])
-        elif routes:
-            top = routes[0]
-            warnings = "; ".join(top.warnings) if top.warnings else "ok"
-            lines.extend([
-                "",
-                "<b>Top route</b>",
-                f"{tg.escape_html(top.route_label)} | {top.size_php:,.0f} PHP",
-                f"Net: <b>{top.profit_php:+,.0f} PHP ({top.profit_pct:+.3f}%)</b> | Grade {top.grade}",
-                f"Warnings: {tg.escape_html(warnings)}",
-            ])
-        else:
-            lines.append("No P2P route meets current capacity filters.")
-        if hold:
-            last_profit = self._num(hold.get("last_profit_php"))
-            last_pct = self._num(hold.get("last_profit_pct"))
-            lines.extend([
-                "",
-                "<b>Open P2P hold</b>",
-                f"{self._num(hold.get('usdt')):,.2f} USDT @ {self._num(hold.get('avg_buy_price')):,.2f}",
-                f"Marked P&L: {last_profit:+,.0f} PHP ({last_pct:+.3f}%)",
-            ])
-        return "\n".join(lines)
 
     def _build_open_tab(self, parent):
         # Open positions
@@ -697,7 +564,7 @@ class Dashboard:
         export_btn = ttk.Button(top, text="Export Ops Report", style="Btn.TButton",
                                 command=self._export_ops_report)
         export_btn.pack(side="right", padx=(0, 6))
-        self._tip(export_btn, "Write a local operations report with futures, P2P, risk, and decision-log snapshots.")
+        self._tip(export_btn, "Write a local operations report with futures, risk, and decision-log snapshots.")
         rebound_btn = ttk.Button(top, text="Run 5Y Rebound", style="Btn.TButton",
                                  command=self._run_rebound_study)
         rebound_btn.pack(side="right", padx=(0, 6))
@@ -715,10 +582,6 @@ class Dashboard:
         self._risk_max_daily_loss = tk.StringVar(value=str(config.RISK_MAX_DAILY_LOSS_USD))
         self._risk_max_exposure = tk.StringVar(value=str(config.RISK_MAX_OPEN_EXPOSURE_USD))
         self._risk_max_loss_streak = tk.StringVar(value=str(config.RISK_MAX_LOSS_STREAK))
-        self._risk_p2p_max_route = tk.StringVar(value=str(config.P2P_MAX_ROUTE_PHP))
-        self._p2p_delay_mins = tk.StringVar(value=str(config.P2P_SETTLEMENT_DELAY_MINS))
-        self._p2p_cancel_rate = tk.StringVar(value=str(config.P2P_CANCEL_RATE_PCT))
-        self._p2p_spread_decay = tk.StringVar(value=str(config.P2P_SPREAD_DECAY_PCT))
 
         def entry(parent_frame, var, width):
             return tk.Entry(
@@ -743,10 +606,6 @@ class Dashboard:
             ("Max daily loss $", self._risk_max_daily_loss, 8),
             ("Max open notional $", self._risk_max_exposure, 9),
             ("Max loss streak", self._risk_max_loss_streak, 5),
-            ("P2P max route PHP", self._risk_p2p_max_route, 9),
-            ("P2P delay min", self._p2p_delay_mins, 6),
-            ("P2P cancel %", self._p2p_cancel_rate, 6),
-            ("P2P decay %", self._p2p_spread_decay, 6),
         ]:
             group = tk.Frame(controls, bg="#0d1117")
             group.pack(side="left", padx=(0, 10))
@@ -1101,12 +960,17 @@ class Dashboard:
         self._force_event.clear()
         self._write_env({"AUTO_START_FUTURES": "false"})
         config.AUTO_START_FUTURES = False
+        if not self._account_lock.acquire(blocking=False):
+            self.status_var.set("Current scan is finishing. Reset again after it finishes.")
+            return
         try:
             summary = self.trader.reset_paper_account(reason="dashboard_reset")
         except Exception as exc:
             logger.exception("Failed to reset futures paper account")
             self.status_var.set(f"Futures reset failed: {exc}")
             return
+        finally:
+            self._account_lock.release()
 
         with self._equity_lock:
             self._equity_history.clear()
@@ -1245,1250 +1109,7 @@ class Dashboard:
         vsb.pack(side="right", fill="y")
         self._refresh_event_ledger()
 
-    # ── P2P arbitrage tab ────────────────────────────────────────────────────
 
-    def _build_p2p_tab(self, parent):
-        body = tk.Frame(parent, bg="#0d1117", padx=15, pady=8)
-        body.pack(fill="both", expand=True)
-
-        top = tk.Frame(body, bg="#0d1117")
-        top.pack(fill="x", pady=(0, 4))
-
-        ttk.Label(top, text="USDT/PHP P2P ASSIST", style="Header.TLabel",
-                  background="#0d1117").pack(side="left")
-        p2p_refresh_btn = ttk.Button(top, text="Refresh Prices", style="Btn.TButton",
-                                     command=self._refresh_p2p)
-        p2p_refresh_btn.pack(side="right")
-        self._tip(p2p_refresh_btn, "Reload live Binance P2P USDT/PHP listings and recalculate route estimates.")
-        p2p_guide_btn = ttk.Button(top, text="P2P Guide", style="Btn.TButton",
-                                   command=self._show_p2p_guide)
-        p2p_guide_btn.pack(side="right", padx=(0, 6))
-        self._tip(p2p_guide_btn, "Open a longer explanation of P2P modes, buttons, and automation scope.")
-
-        controls = tk.Frame(body, bg="#0d1117")
-        controls.pack(fill="x", pady=(0, 4))
-
-        saved_p2p_state = self.p2p_paper.state()
-        saved_p2p_capital = self._num(
-            saved_p2p_state.get("starting_php"),
-            config.P2P_DEFAULT_CAPITAL_PHP,
-        )
-        self._p2p_capital_php = tk.StringVar(value=f"{saved_p2p_capital:.0f}")
-        self._p2p_min_profit_pct = tk.StringVar(value=str(config.P2P_MIN_NET_PCT))
-        self._p2p_transfer_fee_usdt = tk.StringVar(value=str(config.P2P_TRANSFER_FEE_USDT))
-        self._p2p_buffer_php = tk.StringVar(value=str(config.P2P_BUFFER_PHP))
-        if not hasattr(self, "_p2p_delay_mins"):
-            self._p2p_delay_mins = tk.StringVar(value=str(config.P2P_SETTLEMENT_DELAY_MINS))
-        if not hasattr(self, "_p2p_cancel_rate"):
-            self._p2p_cancel_rate = tk.StringVar(value=str(config.P2P_CANCEL_RATE_PCT))
-        if not hasattr(self, "_p2p_spread_decay"):
-            self._p2p_spread_decay = tk.StringVar(value=str(config.P2P_SPREAD_DECAY_PCT))
-        self._p2p_auto_alert = tk.BooleanVar(value=config.P2P_TG_ALERTS)
-        self._p2p_auto_log = tk.BooleanVar(value=config.P2P_AUTO_WATCH_LOG)
-        self._p2p_auto_paper = tk.BooleanVar(value=config.P2P_AUTO_CYCLE)
-        self._p2p_auto_hold_sell = tk.BooleanVar(value=config.P2P_AUTO_HOLD_SELL)
-        self._p2p_mode = tk.StringVar(value=config.P2P_MODE)
-
-        for label_text, var, width in [
-            ("Capital PHP", self._p2p_capital_php, 10),
-            ("Min net %", self._p2p_min_profit_pct, 6),
-            ("Xfer fee USDT", self._p2p_transfer_fee_usdt, 6),
-            ("Buffer PHP", self._p2p_buffer_php, 7),
-            ("Delay min", self._p2p_delay_mins, 6),
-            ("Cancel %", self._p2p_cancel_rate, 6),
-            ("Decay %", self._p2p_spread_decay, 6),
-        ]:
-            group = tk.Frame(controls, bg="#0d1117")
-            group.pack(side="left", padx=(0, 8))
-            label = ttk.Label(group, text=label_text, foreground="#8b949e", background="#0d1117",
-                              font=("Consolas", 8))
-            label.pack(anchor="w")
-            entry_widget = tk.Entry(
-                group,
-                textvariable=var,
-                width=width,
-                font=("Consolas", 9),
-                bg="#f0f6fc",
-                fg="#0d1117",
-                insertbackground="#0d1117",
-                selectbackground="#58a6ff",
-                selectforeground="#0d1117",
-                relief="solid",
-                bd=1,
-                highlightthickness=1,
-                highlightbackground="#8b949e",
-                highlightcolor="#58a6ff",
-            )
-            entry_widget.pack(anchor="w")
-            help_text = P2P_FIELD_HELP.get(label_text, "")
-            self._tip(label, help_text)
-            self._tip(entry_widget, help_text)
-
-        mode_group = tk.Frame(controls, bg="#0d1117")
-        mode_group.pack(side="left", padx=(0, 10), pady=(10, 0))
-        for value, text in [("paper", "Paper Sim (Live Data)"), ("live", "Live Assist")]:
-            rb = tk.Radiobutton(
-                mode_group,
-                text=text,
-                value=value,
-                variable=self._p2p_mode,
-                command=self._sync_p2p_mode_controls,
-                bg="#0d1117",
-                fg="#c9d1d9",
-                selectcolor="#161b22",
-                activebackground="#0d1117",
-                activeforeground="#58a6ff",
-                font=("Consolas", 9),
-            )
-            rb.pack(side="left", padx=(0, 8))
-            self._tip(
-                rb,
-                "Paper Sim uses live listings but writes only paper transactions."
-                if value == "paper"
-                else "Live Assist scans, scores, logs, and alerts only. Fiat payment and release remain manual.",
-            )
-
-        recalc_btn = ttk.Button(controls, text="Recalculate Only", style="Btn.TButton",
-                                command=self._recalculate_p2p_routes)
-        recalc_btn.pack(side="left", padx=(0, 10), pady=(10, 0))
-        self._tip(recalc_btn, "Recalculate route estimates from the current live listings. It does not create a paper transaction.")
-
-        action_bar = tk.Frame(body, bg="#0d1117")
-        action_bar.pack(fill="x", pady=(0, 4))
-
-        self._p2p_paper_actions = tk.Frame(action_bar, bg="#0d1117")
-        paper_cycle_btn = ttk.Button(self._p2p_paper_actions, text="Paper Buy+Sell", style="Btn.TButton",
-                                     command=self._paper_cycle_now)
-        paper_cycle_btn.pack(side="left", padx=(0, 6))
-        self._tip(paper_cycle_btn, "Instant paper cycle: buy paper USDT and sell it immediately if the current route passes filters.")
-        paper_hold_btn = ttk.Button(self._p2p_paper_actions, text="Paper Buy Hold", style="Btn.TButton",
-                                    command=self._paper_hold_buy_now)
-        paper_hold_btn.pack(side="left", padx=(0, 6))
-        self._tip(paper_hold_btn, "Open a paper USDT inventory hold, then wait for a better sell price before closing.")
-        check_hold_btn = ttk.Button(self._p2p_paper_actions, text="Check/Sell Hold", style="Btn.TButton",
-                                    command=self._check_p2p_hold_sell)
-        check_hold_btn.pack(side="left", padx=(0, 6))
-        self._tip(check_hold_btn, "Check the open paper hold against current buyer listings. It sells only when target profit is met.")
-        reset_paper_btn = ttk.Button(self._p2p_paper_actions, text="Reset Paper", style="Btn.TButton",
-                                     command=self._reset_p2p_paper)
-        reset_paper_btn.pack(side="left", padx=(0, 6))
-        self._tip(reset_paper_btn, "Archive the current P2P paper session/history and start a fresh paper balance.")
-        send_tg_btn = ttk.Button(self._p2p_paper_actions, text="Send TG", style="Btn.TButton",
-                                 command=self._send_p2p_live_snapshot)
-        send_tg_btn.pack(side="left", padx=(0, 12))
-        self._tip(send_tg_btn, "Send the current P2P snapshot and paper summary to Telegram.")
-        self._p2p_paper_alert = self._p2p_checkbutton(
-            self._p2p_paper_actions,
-            text="TG Alerts",
-            variable=self._p2p_auto_alert,
-        )
-        self._p2p_paper_alert.pack(side="left", padx=(0, 10))
-        self._tip(self._p2p_paper_alert, "Send Telegram alerts for P2P paper events and snapshots.")
-        self._p2p_paper_auto = self._p2p_checkbutton(
-            self._p2p_paper_actions,
-            text="Auto Cycle",
-            variable=self._p2p_auto_paper,
-        )
-        self._p2p_paper_auto.pack(side="left", padx=(0, 10))
-        self._tip(self._p2p_paper_auto, "On refresh, auto-run Paper Buy+Sell only when a profitable route passes filters, no hold is open, and cooldown is satisfied.")
-        self._p2p_hold_auto = self._p2p_checkbutton(
-            self._p2p_paper_actions,
-            text="Auto Hold Sell",
-            variable=self._p2p_auto_hold_sell,
-        )
-        self._p2p_hold_auto.pack(side="left")
-        self._tip(self._p2p_hold_auto, "On refresh, automatically check the open hold and sell only when target profit is met.")
-
-        self._p2p_live_actions = tk.Frame(action_bar, bg="#0d1117")
-        live_snapshot_btn = ttk.Button(self._p2p_live_actions, text="Send Live Snapshot", style="Btn.TButton",
-                                       command=self._send_p2p_live_snapshot)
-        live_snapshot_btn.pack(side="left", padx=(0, 6))
-        self._tip(live_snapshot_btn, "Send the current live-assist route snapshot to Telegram. No trade is executed.")
-        live_log_btn = ttk.Button(self._p2p_live_actions, text="Log Watch Route", style="Btn.TButton",
-                                  command=self._log_top_p2p_route)
-        live_log_btn.pack(side="left", padx=(0, 12))
-        self._tip(live_log_btn, "Write the current best watch route to the local P2P journal for later review.")
-        self._p2p_live_alert = self._p2p_checkbutton(
-            self._p2p_live_actions,
-            text="Telegram Alerts",
-            variable=self._p2p_auto_alert,
-        )
-        self._p2p_live_alert.pack(side="left", padx=(0, 10))
-        self._tip(self._p2p_live_alert, "Send Telegram alerts for live-assist opportunities. No automatic P2P trading is performed.")
-        self._p2p_live_log = self._p2p_checkbutton(
-            self._p2p_live_actions,
-            text="Auto Watch Log",
-            variable=self._p2p_auto_log,
-        )
-        self._p2p_live_log.pack(side="left")
-        self._tip(self._p2p_live_log, "Automatically log the best live-assist watch route on refresh when it changes.")
-
-        self._p2p_status_var = tk.StringVar(value="Open this tab or press Refresh to load prices.")
-        ttk.Label(body, textvariable=self._p2p_status_var, foreground="#8b949e",
-                  background="#0d1117", font=("Consolas", 9)).pack(fill="x", anchor="w")
-        self._sync_p2p_mode_controls()
-
-        summary = tk.Frame(body, bg="#0d1117")
-        summary.pack(fill="x", pady=(4, 6))
-
-        self._p2p_buy_var = tk.StringVar(value="--")
-        self._p2p_sell_var = tk.StringVar(value="--")
-        self._p2p_top_profit_var = tk.StringVar(value="--")
-        self._p2p_top_route_var = tk.StringVar(value="--")
-        self._p2p_sweep_profit_var = tk.StringVar(value="--")
-        self._p2p_paper_balance_var = tk.StringVar(value="--")
-        self._p2p_paper_cycles_var = tk.StringVar(value="--")
-        self._p2p_hold_usdt_var = tk.StringVar(value="--")
-        self._p2p_hold_pnl_var = tk.StringVar(value="--")
-
-        for label_text, var in [
-            ("BEST BUY USDT", self._p2p_buy_var),
-            ("BEST SELL USDT", self._p2p_sell_var),
-            ("TOP NET PROFIT", self._p2p_top_profit_var),
-            ("DEPTH SWEEP", self._p2p_sweep_profit_var),
-            ("PAPER BAL", self._p2p_paper_balance_var),
-            ("CYCLES", self._p2p_paper_cycles_var),
-            ("HOLD USDT", self._p2p_hold_usdt_var),
-            ("HOLD P&L", self._p2p_hold_pnl_var),
-        ]:
-            card = tk.Frame(summary, bg="#161b22",
-                            highlightbackground="#30363d", highlightthickness=1)
-            card.pack(side="left", padx=(0, 5), ipadx=7, ipady=4)
-            label = ttk.Label(card, text=label_text, foreground="#8b949e", background="#161b22",
-                              font=("Consolas", 8))
-            label.pack(anchor="w")
-            value = ttk.Label(card, textvariable=var, foreground="#58a6ff", background="#161b22",
-                              font=("Consolas", 12, "bold"))
-            value.pack(anchor="w")
-            help_text = P2P_SUMMARY_HELP.get(label_text, "")
-            self._tip(card, help_text)
-            self._tip(label, help_text)
-            self._tip(value, help_text)
-        self._refresh_p2p_paper_summary()
-
-        route_section = tk.Frame(body, bg="#0d1117")
-        route_section.pack(fill="x", expand=False, pady=(0, 4))
-        ttk.Label(route_section, text="ROUTE CALCULATOR", style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(0, 3))
-
-        route_cols = ("route", "size", "buy", "sell", "profit", "pct", "grade", "warnings")
-        self.p2p_route_tree = ttk.Treeview(route_section, columns=route_cols, show="headings", height=2)
-        for col, heading, width in [
-            ("route", "ROUTE", 115),
-            ("size", "SIZE PHP", 95),
-            ("buy", "BUY", 135),
-            ("sell", "SELL", 135),
-            ("profit", "NET PHP", 95),
-            ("pct", "NET %", 65),
-            ("grade", "GRADE", 65),
-            ("warnings", "WARNINGS", 200),
-        ]:
-            self.p2p_route_tree.heading(col, text=heading)
-            self.p2p_route_tree.column(col, width=width, anchor="center")
-        self.p2p_route_tree.tag_configure("A", foreground="#3fb950")
-        self.p2p_route_tree.tag_configure("B", foreground="#58a6ff")
-        self.p2p_route_tree.tag_configure("C", foreground="#e3b341")
-        self.p2p_route_tree.tag_configure("REVIEW", foreground="#f85149")
-        self.p2p_route_tree.tag_configure("WATCH", foreground="#8b949e")
-        self.p2p_route_tree.tag_configure("SKIP", foreground="#f85149")
-        self.p2p_route_tree.pack(fill="both", expand=True)
-
-        ad_tables = tk.Frame(body, bg="#0d1117")
-        ad_tables.pack(fill="both", expand=True)
-        ad_tables.configure(height=300)
-        ad_tables.pack_propagate(False)
-        buy_parent = tk.Frame(ad_tables, bg="#0d1117")
-        sell_parent = tk.Frame(ad_tables, bg="#0d1117")
-        buy_parent.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        sell_parent.pack(side="left", fill="both", expand=True, padx=(6, 0))
-
-        self.p2p_buy_tree = self._build_p2p_table(
-            buy_parent,
-            "BUY USDT WITH PHP (LOWEST SELLER PRICES)",
-            height=12,
-        )
-        self.p2p_sell_tree = self._build_p2p_table(
-            sell_parent,
-            "SELL USDT FOR PHP (HIGHEST BUYER PRICES)",
-            height=12,
-        )
-        self._refresh_p2p_journal()
-        self._refresh_p2p_transactions()
-
-    def _show_p2p_guide(self):
-        text = (
-            "Inputs\n"
-            "Capital PHP: paper bankroll used for route sizing.\n"
-            "Min net %: minimum net profit after paper buffers before a route can execute.\n"
-            "Xfer fee USDT: simulated crypto transfer/network cost deducted from the route.\n"
-            "Buffer PHP: extra peso cost buffer deducted from expected profit.\n"
-            "Delay min: settlement-delay assumption; longer delay increases spread-decay risk.\n"
-            "Cancel %: simulated failed/cancelled order rate haircut.\n"
-            "Decay %: spread haircut while manual P2P settlement is happening.\n\n"
-            "Modes\n"
-            "Paper Sim (Live Data): reads live listings and can write paper transactions.\n"
-            "Live Assist: reads live listings only; it does not change paper balance.\n\n"
-            "Buttons\n"
-            "Refresh Prices: fetch latest P2P listings.\n"
-            "Recalculate Only: rebuild routes without recording a paper trade.\n"
-            "Paper Buy+Sell: simulate one complete buy-low/sell-high cycle if a route passes filters.\n"
-            "Paper Buy Hold: buy paper USDT inventory and wait for a better sell price.\n"
-            "Check/Sell Hold: sell the open paper hold only if the current sell route meets target.\n"
-            "Reset Paper: reset P2P paper balance/history only; futures is not touched.\n"
-            "Send TG: send the current P2P dashboard snapshot to Telegram.\n\n"
-            "Checkboxes\n"
-            "TG Alerts: send paper/live-assist alerts to Telegram.\n"
-            "Auto Cycle: on refresh, auto-run Paper Buy+Sell only when a profitable route passes filters. "
-            "It compounds free cash, waits for the settlement-delay window, and pauses while a Hold is open.\n"
-            "Auto Hold Sell: on refresh, auto-check the open hold and sell only when target is met."
-        )
-        messagebox.showinfo("P2P Arb Controls", text, parent=self.root)
-
-    def _build_p2p_history_tab(self, parent):
-        body = tk.Frame(parent, bg="#0d1117", padx=15, pady=12)
-        body.pack(fill="both", expand=True)
-
-        top = tk.Frame(body, bg="#0d1117")
-        top.pack(fill="x", pady=(0, 8))
-        ttk.Label(top, text="P2P PAPER HISTORY", style="Header.TLabel",
-                  background="#0d1117").pack(side="left")
-        ttk.Button(top, text="Refresh", style="Btn.TButton",
-                   command=self._refresh_p2p_history_tab).pack(side="right")
-
-        self._p2p_history_summary_var = tk.StringVar(value="")
-        ttk.Label(body, textvariable=self._p2p_history_summary_var,
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 9)).pack(fill="x", anchor="w", pady=(0, 8))
-
-        tx = tk.Frame(body, bg="#0d1117")
-        tx.pack(fill="both", expand=True, pady=(0, 10))
-        ttk.Label(tx, text="P2P PAPER TRANSACTION HISTORY", style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(0, 3))
-        tx_cols = ("time", "type", "status", "php", "usdt", "profit", "balance", "notes")
-        self.p2p_history_tx_tree = ttk.Treeview(tx, columns=tx_cols, show="headings", height=13)
-        for col, heading, width in [
-            ("time", "TIME", 135),
-            ("type", "TYPE", 110),
-            ("status", "STATUS", 90),
-            ("php", "PHP", 105),
-            ("usdt", "USDT", 105),
-            ("profit", "P&L PHP", 105),
-            ("balance", "BALANCE", 110),
-            ("notes", "NOTES", 430),
-        ]:
-            self.p2p_history_tx_tree.heading(col, text=heading)
-            self.p2p_history_tx_tree.column(col, width=width, anchor="center")
-        self.p2p_history_tx_tree.tag_configure("profit", foreground="#3fb950")
-        self.p2p_history_tx_tree.tag_configure("loss", foreground="#f85149")
-        tx_vsb = ttk.Scrollbar(tx, orient="vertical", command=self.p2p_history_tx_tree.yview)
-        self.p2p_history_tx_tree.configure(yscrollcommand=tx_vsb.set)
-        self.p2p_history_tx_tree.pack(side="left", fill="both", expand=True)
-        tx_vsb.pack(side="right", fill="y")
-
-        journal = tk.Frame(body, bg="#0d1117")
-        journal.pack(fill="both", expand=True)
-        ttk.Label(journal, text="P2P WATCH ROUTE JOURNAL", style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(0, 3))
-        journal_cols = ("time", "status", "route", "size", "profit", "notes")
-        self.p2p_history_journal_tree = ttk.Treeview(
-            journal, columns=journal_cols, show="headings", height=7,
-        )
-        for col, heading, width in [
-            ("time", "TIME", 135),
-            ("status", "STATUS", 95),
-            ("route", "ROUTE", 145),
-            ("size", "SIZE PHP", 105),
-            ("profit", "EXP PHP", 105),
-            ("notes", "NOTES", 520),
-        ]:
-            self.p2p_history_journal_tree.heading(col, text=heading)
-            self.p2p_history_journal_tree.column(col, width=width, anchor="center")
-        self.p2p_history_journal_tree.pack(fill="both", expand=True)
-        self._refresh_p2p_history_tab()
-
-    def _p2p_checkbutton(self, parent, text: str, variable: tk.BooleanVar):
-        return tk.Checkbutton(
-            parent,
-            text=text,
-            variable=variable,
-            bg="#0d1117",
-            fg="#c9d1d9",
-            selectcolor="#161b22",
-            activebackground="#0d1117",
-            activeforeground="#58a6ff",
-            font=("Consolas", 9),
-        )
-
-    def _p2p_current_mode(self) -> str:
-        if not hasattr(self, "_p2p_mode"):
-            return "paper"
-        return self._p2p_mode.get() or "paper"
-
-    @staticmethod
-    def _env_bool(value: bool) -> str:
-        return "true" if value else "false"
-
-    @staticmethod
-    def _env_number(value: float) -> str:
-        if abs(value - round(value)) < 0.0000001:
-            return str(int(round(value)))
-        return f"{value:.8f}".rstrip("0").rstrip(".")
-
-    def _p2p_control_updates(self, settings: P2PRouteSettings | None = None) -> dict[str, str] | None:
-        try:
-            capital = settings.capital_php if settings else float(self._p2p_capital_php.get())
-            min_pct = settings.min_profit_pct if settings else float(self._p2p_min_profit_pct.get())
-            transfer_fee = (
-                settings.cross_exchange_transfer_fee_usdt
-                if settings
-                else float(self._p2p_transfer_fee_usdt.get())
-            )
-            buffer_php = settings.local_buffer_php if settings else float(self._p2p_buffer_php.get())
-            delay = float(self._p2p_delay_mins.get())
-            cancel = float(self._p2p_cancel_rate.get())
-            decay = float(self._p2p_spread_decay.get())
-        except (AttributeError, TypeError, ValueError):
-            return None
-
-        if min(capital, min_pct, transfer_fee, buffer_php, delay, cancel, decay) < 0:
-            return None
-
-        mode = self._p2p_current_mode()
-        if mode not in {"paper", "live"}:
-            mode = "paper"
-
-        return {
-            "P2P_DEFAULT_CAPITAL_PHP": self._env_number(capital),
-            "P2P_MIN_NET_PCT": self._env_number(min_pct),
-            "P2P_TRANSFER_FEE_USDT": self._env_number(transfer_fee),
-            "P2P_BUFFER_PHP": self._env_number(buffer_php),
-            "P2P_SETTLEMENT_DELAY_MINS": self._env_number(delay),
-            "P2P_CANCEL_RATE_PCT": self._env_number(cancel),
-            "P2P_SPREAD_DECAY_PCT": self._env_number(decay),
-            "P2P_MODE": mode,
-            "P2P_TG_ALERTS": self._env_bool(self._p2p_auto_alert.get()),
-            "P2P_AUTO_CYCLE": self._env_bool(self._p2p_auto_paper.get()),
-            "P2P_AUTO_HOLD_SELL": self._env_bool(self._p2p_auto_hold_sell.get()),
-            "P2P_AUTO_WATCH_LOG": self._env_bool(self._p2p_auto_log.get()),
-        }
-
-    def _persist_p2p_controls(self, settings: P2PRouteSettings | None = None) -> None:
-        updates = self._p2p_control_updates(settings)
-        if not updates or updates == self._p2p_last_saved_controls:
-            return
-        self._write_env(updates)
-        self._p2p_last_saved_controls = dict(updates)
-
-        config.P2P_DEFAULT_CAPITAL_PHP = float(updates["P2P_DEFAULT_CAPITAL_PHP"])
-        config.P2P_MIN_NET_PCT = float(updates["P2P_MIN_NET_PCT"])
-        config.P2P_TRANSFER_FEE_USDT = float(updates["P2P_TRANSFER_FEE_USDT"])
-        config.P2P_BUFFER_PHP = float(updates["P2P_BUFFER_PHP"])
-        config.P2P_SETTLEMENT_DELAY_MINS = float(updates["P2P_SETTLEMENT_DELAY_MINS"])
-        config.P2P_CANCEL_RATE_PCT = float(updates["P2P_CANCEL_RATE_PCT"])
-        config.P2P_SPREAD_DECAY_PCT = float(updates["P2P_SPREAD_DECAY_PCT"])
-        config.P2P_MODE = updates["P2P_MODE"]
-        config.P2P_TG_ALERTS = updates["P2P_TG_ALERTS"] == "true"
-        config.P2P_AUTO_CYCLE = updates["P2P_AUTO_CYCLE"] == "true"
-        config.P2P_AUTO_HOLD_SELL = updates["P2P_AUTO_HOLD_SELL"] == "true"
-        config.P2P_AUTO_WATCH_LOG = updates["P2P_AUTO_WATCH_LOG"] == "true"
-
-    def _sync_p2p_mode_controls(self):
-        if not hasattr(self, "_p2p_paper_actions") or not hasattr(self, "_p2p_live_actions"):
-            return
-        self._p2p_paper_actions.pack_forget()
-        self._p2p_live_actions.pack_forget()
-        if self._p2p_current_mode() == "live":
-            self._p2p_live_actions.pack(side="left", fill="x")
-            if hasattr(self, "_p2p_status_var"):
-                self._p2p_status_var.set(
-                    "Live Assist: scan, alert, and log only. No P2P order, fiat, or release is automated."
-                )
-        else:
-            self._p2p_paper_actions.pack(side="left", fill="x")
-            if hasattr(self, "_p2p_status_var"):
-                self._p2p_status_var.set(
-                    "Paper Sim uses live Binance P2P listings. Buy+Sell closes now; Buy Hold waits for target."
-                )
-        self._persist_p2p_controls()
-
-    def _build_p2p_table(self, parent, title: str, height: int):
-        section = tk.Frame(parent, bg="#0d1117")
-        section.pack(fill="both", expand=True, pady=(0, 2))
-
-        ttk.Label(section, text=title, style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(0, 3))
-
-        table_frame = tk.Frame(section, bg="#0d1117")
-        table_frame.pack(fill="both", expand=True)
-
-        cols = ("price", "limits", "available", "methods", "advertiser", "finish", "orders")
-        tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=height)
-        for col, heading, width, stretch in [
-            ("price", "PRICE PHP", 82, False),
-            ("limits", "LIMIT PHP", 135, False),
-            ("available", "AVAIL USDT", 105, False),
-            ("methods", "PAYMENT", 150, True),
-            ("advertiser", "ADVERTISER", 145, True),
-            ("finish", "FINISH", 68, False),
-            ("orders", "ORDERS", 68, False),
-        ]:
-            tree.heading(col, text=heading)
-            tree.column(col, width=width, minwidth=55, anchor="center", stretch=stretch)
-
-        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        table_frame.rowconfigure(0, weight=1)
-        table_frame.columnconfigure(0, weight=1)
-        tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        return tree
-
-    def _refresh_p2p(self):
-        if self._p2p_refreshing:
-            return
-        if not hasattr(self, "_p2p_status_var"):
-            return
-
-        self._p2p_refreshing = True
-        self._p2p_next_refresh_ts = time.time() + self.P2P_REFRESH_SECS
-        self._p2p_status_var.set("Loading Binance P2P USDT/PHP and recalculating routes...")
-
-        worker = threading.Thread(target=self._load_p2p_snapshot, daemon=True)
-        worker.start()
-
-    def _load_p2p_snapshot(self):
-        snapshot = None
-        error = None
-        try:
-            snapshot = self.p2p_monitor.fetch_snapshot(rows=20)
-        except Exception as exc:
-            logger.exception("Failed to refresh P2P monitor")
-            error = str(exc)
-
-        def finish():
-            self._p2p_refreshing = False
-            if snapshot:
-                self._apply_p2p_snapshot(snapshot)
-            else:
-                self._p2p_status_var.set(f"P2P load failed: {error or 'unknown error'}")
-
-        try:
-            self.root.after(0, finish)
-        except tk.TclError:
-            pass
-
-    def _apply_p2p_snapshot(self, snapshot: P2PSnapshot):
-        self._p2p_last_snapshot = snapshot
-
-        buy = snapshot.best_buy
-        sell = snapshot.best_sell
-
-        self._p2p_buy_var.set(f"{buy.price:,.2f} PHP" if buy else "--")
-        self._p2p_sell_var.set(f"{sell.price:,.2f} PHP" if sell else "--")
-
-        self._fill_p2p_tree(self.p2p_buy_tree, snapshot.buy_ads)
-        self._fill_p2p_tree(self.p2p_sell_tree, snapshot.sell_ads)
-
-        self._p2p_status_var.set(
-            f"USDT/PHP updated {snapshot.as_of.strftime('%H:%M:%S')} UTC  |  "
-            "Routes are estimates only; manual fiat verification is still required."
-        )
-        self._recalculate_p2p_routes(update_status=False, run_automation=True)
-
-    def _recalculate_p2p_routes(self, update_status: bool = True, run_automation: bool = False):
-        settings = self._p2p_route_settings()
-        if not settings:
-            return
-
-        state, capital_delta = self.p2p_paper.sync_starting_capital(settings.capital_php)
-        self._refresh_p2p_paper_summary(state)
-
-        if not self._p2p_last_snapshot:
-            if update_status and hasattr(self, "_p2p_status_var"):
-                self._p2p_status_var.set(
-                    self._p2p_capital_status(
-                        capital_delta,
-                        "Load P2P prices before recalculating routes.",
-                    )
-                )
-            return
-
-        scan_settings = self._p2p_capped_route_settings(settings)
-        self._p2p_routes = build_p2p_routes([self._p2p_last_snapshot], settings=scan_settings)
-        raw_sweep = build_depth_sweep([self._p2p_last_snapshot], settings=scan_settings)
-        self._p2p_sweep = self._apply_p2p_realism(raw_sweep) if raw_sweep else None
-        self._fill_p2p_route_tree(self._p2p_routes)
-        self._update_p2p_sweep_summary()
-        self._refresh_p2p_paper_summary()
-
-        decision_reason = "no route meets current filters"
-        decision = "SKIP"
-        score = 0.0
-        if self._p2p_sweep:
-            decision_reason = (
-                f"sweep {self._p2p_sweep.profit_php:+,.0f} PHP "
-                f"({self._p2p_sweep.profit_pct:+.3f}%) grade {self._p2p_sweep.grade}"
-            )
-            decision = "RUN" if self._p2p_sweep.profit_pct >= settings.min_profit_pct and self._p2p_sweep.profit_php > 0 else "SKIP"
-            score = max(0.0, min(100.0, self._p2p_sweep.profit_pct / max(settings.min_profit_pct, 0.001) * 60))
-        self._record_decision("p2p", "recalculate", decision, score, decision_reason)
-
-        if self._p2p_routes:
-            top = self._p2p_routes[0]
-            self._p2p_top_profit_var.set(f"{top.profit_php:+,.0f} PHP")
-            self._p2p_top_route_var.set(f"{top.route_label} {top.grade}")
-            if update_status:
-                self._p2p_status_var.set(
-                    self._p2p_capital_status(
-                        capital_delta,
-                        f"Recalculated {len(self._p2p_routes)} route(s) for "
-                        f"{settings.capital_php:,.0f} PHP capital. No paper transaction was recorded.",
-                    )
-                )
-        else:
-            self._p2p_top_profit_var.set("--")
-            self._p2p_top_route_var.set("--")
-            if update_status:
-                self._p2p_status_var.set(
-                    self._p2p_capital_status(
-                        capital_delta,
-                        "No route meets the current profit filters. No paper transaction was recorded.",
-                    )
-                )
-
-        if not run_automation:
-            return
-
-        if self._p2p_current_mode() == "live":
-            self._run_p2p_live_assist(settings)
-        else:
-            if self._p2p_auto_paper.get():
-                self._execute_p2p_paper_cycle(auto=True)
-            if self._p2p_auto_hold_sell.get():
-                self._evaluate_p2p_hold(auto=True)
-
-    def _p2p_route_settings(self) -> P2PRouteSettings | None:
-        try:
-            capital_php = float(self._p2p_capital_php.get())
-            min_profit_pct = float(self._p2p_min_profit_pct.get())
-            transfer_fee = float(self._p2p_transfer_fee_usdt.get())
-            buffer_php = float(self._p2p_buffer_php.get())
-        except ValueError as exc:
-            self._p2p_status_var.set(f"P2P settings error: {exc}")
-            return None
-
-        if capital_php <= 0:
-            self._p2p_status_var.set("P2P settings error: capital must be positive")
-            return None
-        if min_profit_pct < 0 or transfer_fee < 0 or buffer_php < 0:
-            self._p2p_status_var.set("P2P settings error: min %, fee, and buffer cannot be negative")
-            return None
-
-        settings = P2PRouteSettings(
-            capital_php=capital_php,
-            min_profit_php=-1_000_000_000.0,
-            min_profit_pct=min_profit_pct,
-            cross_exchange_transfer_fee_usdt=transfer_fee,
-            local_buffer_php=buffer_php,
-        )
-        self._p2p_settings_cache = settings
-        self._persist_p2p_controls(settings)
-        return settings
-
-    def _p2p_starting_capital_php(self) -> float:
-        if hasattr(self, "_p2p_capital_php"):
-            return self._num(self._p2p_capital_php.get(), 500_000)
-        return 500_000.0
-
-    @staticmethod
-    def _p2p_capped_route_settings(settings: P2PRouteSettings) -> P2PRouteSettings:
-        route_cap = config.P2P_MAX_ROUTE_PHP
-        capital_php = settings.capital_php
-        if route_cap > 0:
-            capital_php = min(capital_php, route_cap)
-        return P2PRouteSettings(
-            capital_php=capital_php,
-            min_profit_php=settings.min_profit_php,
-            min_profit_pct=settings.min_profit_pct,
-            min_completion_rate=settings.min_completion_rate,
-            min_orders=settings.min_orders,
-            cross_exchange_transfer_fee_usdt=settings.cross_exchange_transfer_fee_usdt,
-            local_buffer_php=settings.local_buffer_php,
-            allowed_methods=settings.allowed_methods,
-        )
-
-    def _p2p_realism_settings(self) -> P2PRealismSettings:
-        try:
-            delay = float(self._p2p_delay_mins.get()) if hasattr(self, "_p2p_delay_mins") else config.P2P_SETTLEMENT_DELAY_MINS
-            cancel = float(self._p2p_cancel_rate.get()) if hasattr(self, "_p2p_cancel_rate") else config.P2P_CANCEL_RATE_PCT
-            decay = float(self._p2p_spread_decay.get()) if hasattr(self, "_p2p_spread_decay") else config.P2P_SPREAD_DECAY_PCT
-        except Exception:
-            delay = config.P2P_SETTLEMENT_DELAY_MINS
-            cancel = config.P2P_CANCEL_RATE_PCT
-            decay = config.P2P_SPREAD_DECAY_PCT
-        return P2PRealismSettings(
-            settlement_delay_mins=max(0.0, delay),
-            cancel_rate_pct=max(0.0, cancel),
-            spread_decay_pct=max(0.0, decay),
-        )
-
-    def _apply_p2p_realism(self, sweep: P2PDepthSweep) -> P2PDepthSweep:
-        return apply_realism_to_sweep(sweep, realism=self._p2p_realism_settings())
-
-    def _fill_p2p_route_tree(self, routes: list[P2PRoute]):
-        for item in self.p2p_route_tree.get_children():
-            self.p2p_route_tree.delete(item)
-
-        if self._p2p_sweep:
-            warnings = "; ".join(self._p2p_sweep.warnings) if self._p2p_sweep.warnings else "ok"
-            self.p2p_route_tree.insert("", "end", tags=(self._p2p_sweep.grade,), values=(
-                "DEPTH SWEEP",
-                f"{self._p2p_sweep.size_php:,.0f}",
-                f"avg {self._p2p_sweep.avg_buy_price:,.2f}",
-                f"avg {self._p2p_sweep.avg_sell_price:,.2f}",
-                f"{self._p2p_sweep.profit_php:+,.0f}",
-                f"{self._p2p_sweep.profit_pct:+.3f}%",
-                self._p2p_sweep.grade,
-                self._clip_text(warnings, 34),
-            ))
-
-        for route in routes:
-            warnings = "; ".join(route.warnings) if route.warnings else "ok"
-            self.p2p_route_tree.insert("", "end", tags=(route.grade,), values=(
-                route.route_label,
-                f"{route.size_php:,.0f}",
-                f"{route.buy_ad.marketplace} {route.buy_ad.price:,.2f}",
-                f"{route.sell_ad.marketplace} {route.sell_ad.price:,.2f}",
-                f"{route.profit_php:+,.0f}",
-                f"{route.profit_pct:+.3f}%",
-                route.grade,
-                self._clip_text(warnings, 34),
-            ))
-        self.p2p_route_tree.yview_moveto(0)
-
-    def _update_p2p_sweep_summary(self):
-        if not self._p2p_sweep:
-            self._p2p_sweep_profit_var.set("--")
-            return
-        sweep = self._p2p_sweep
-        self._p2p_sweep_profit_var.set(f"{sweep.profit_php:+,.0f} PHP")
-
-    def _run_p2p_live_assist(self, settings: P2PRouteSettings):
-        if not self._p2p_last_snapshot:
-            return
-        if getattr(self, "_p2p_auto_log", None) and self._p2p_auto_log.get():
-            self._auto_log_p2p_route(settings)
-        if getattr(self, "_p2p_auto_alert", None) and self._p2p_auto_alert.get():
-            self._maybe_send_p2p_assist_alert(settings)
-
-    def _auto_log_p2p_route(self, settings: P2PRouteSettings):
-        if not self._p2p_routes:
-            return
-        route = self._p2p_routes[0]
-        if route.profit_php <= 0 or route.profit_pct < settings.min_profit_pct:
-            return
-        key = (
-            f"{route.route_label}|{route.size_php:.0f}|"
-            f"{route.buy_ad.price:.2f}|{route.sell_ad.price:.2f}|{route.profit_php:.0f}"
-        )
-        if key == self._p2p_last_logged_route_key:
-            return
-        self._p2p_last_logged_route_key = key
-        self.p2p_journal.append(route, status="AUTO_WATCH", notes="live assist")
-        self._refresh_p2p_journal()
-
-    def _maybe_send_p2p_assist_alert(self, settings: P2PRouteSettings):
-        key = ""
-        text = ""
-        if self._p2p_sweep and self._p2p_sweep.profit_php > 0 and self._p2p_sweep.profit_pct >= settings.min_profit_pct:
-            sweep = self._p2p_sweep
-            key = (
-                f"SWEEP|{sweep.size_php:.0f}|{sweep.avg_buy_price:.2f}|"
-                f"{sweep.avg_sell_price:.2f}|{sweep.profit_php:.0f}"
-            )
-            warnings = "; ".join(sweep.warnings) if sweep.warnings else "ok"
-            text = "\n".join([
-                f"Depth sweep: <b>{sweep.size_php:,.0f} PHP</b>",
-                f"Avg buy/sell: <b>{sweep.avg_buy_price:,.2f}</b> / <b>{sweep.avg_sell_price:,.2f}</b>",
-                f"Net: <b>{sweep.profit_php:+,.0f} PHP ({sweep.profit_pct:+.3f}%)</b> | Grade {sweep.grade}",
-                f"Warnings: {tg.escape_html(warnings)}",
-                "Manual fiat/payment/release confirmation required.",
-            ])
-        elif self._p2p_routes:
-            route = self._p2p_routes[0]
-            if route.profit_php <= 0 or route.profit_pct < settings.min_profit_pct:
-                return
-            key = (
-                f"ROUTE|{route.route_label}|{route.size_php:.0f}|"
-                f"{route.buy_ad.price:.2f}|{route.sell_ad.price:.2f}|{route.profit_php:.0f}"
-            )
-            warnings = "; ".join(route.warnings) if route.warnings else "ok"
-            text = "\n".join([
-                f"Route: <b>{tg.escape_html(route.route_label)}</b>",
-                f"Size: <b>{route.size_php:,.0f} PHP</b>",
-                f"Buy/sell: <b>{route.buy_ad.price:,.2f}</b> / <b>{route.sell_ad.price:,.2f}</b>",
-                f"Net: <b>{route.profit_php:+,.0f} PHP ({route.profit_pct:+.3f}%)</b> | Grade {route.grade}",
-                f"Warnings: {tg.escape_html(warnings)}",
-                "Manual fiat/payment/release confirmation required.",
-            ])
-        if not key:
-            return
-        now = time.time()
-        if key == self._p2p_last_alert_key:
-            return
-        if now - self._p2p_last_alert_ts < self.P2P_ALERT_COOLDOWN_SECS:
-            return
-        self._p2p_last_alert_key = key
-        self._p2p_last_alert_ts = now
-        tg.alert_p2p_signal(text)
-
-    def _send_p2p_live_snapshot(self):
-        if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-            self._p2p_status_var.set("Telegram snapshot needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.")
-            return
-        self._p2p_status_var.set("Sending live P2P snapshot to Telegram...")
-
-        def worker():
-            try:
-                text = self._telegram_p2p_snapshot()
-                tg.send_dashboard_text(text)
-                status = "Live P2P snapshot sent to Telegram."
-            except Exception as exc:
-                logger.exception("Failed to send P2P Telegram snapshot")
-                status = f"Telegram P2P snapshot failed: {exc}"
-            try:
-                self.root.after(0, lambda: self._p2p_status_var.set(status))
-            except tk.TclError:
-                pass
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _send_p2p_paper_event(self, title: str, lines: list[str]):
-        if not hasattr(self, "_p2p_auto_alert") or not self._p2p_auto_alert.get():
-            return
-        text = "\n".join([
-            f"🧾 <b>TradingBot23 P2P Paper - {tg.escape_html(title)}</b>",
-            *lines,
-        ])
-        if config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID:
-            tg.send_dashboard_text(text)
-        ov.send(text, title=f"TradingBot23 P2P Paper - {title}", source="tradingbot23-p2p")
-
-    def _paper_cycle_now(self):
-        if not self._p2p_last_snapshot:
-            self._refresh_p2p()
-            self._p2p_status_var.set("Loading prices first; press Run Instant Paper Cycle again after refresh.")
-            return
-        self._recalculate_p2p_routes(update_status=False)
-        self._execute_p2p_paper_cycle(auto=False)
-
-    def _paper_hold_buy_now(self):
-        if not self._p2p_last_snapshot:
-            self._refresh_p2p()
-            self._p2p_status_var.set("Loading prices first; press Open Paper Hold again after refresh.")
-            return
-        settings = self._p2p_route_settings()
-        if not settings:
-            return
-        state, _ = self.p2p_paper.sync_starting_capital(settings.capital_php)
-        if state.get("hold_position"):
-            self._p2p_status_var.set("Hold buy skipped: one P2P hold is already open.")
-            self._refresh_p2p_paper_summary(state)
-            return
-        cash_php = self._num(state.get("cash_php"), settings.capital_php)
-        if cash_php <= 0:
-            self._p2p_status_var.set("Hold buy skipped: no free PHP paper cash.")
-            return
-
-        hold_settings = P2PRouteSettings(
-            capital_php=min(settings.capital_php, cash_php),
-            min_profit_php=settings.min_profit_php,
-            min_profit_pct=settings.min_profit_pct,
-            min_completion_rate=settings.min_completion_rate,
-            min_orders=settings.min_orders,
-            cross_exchange_transfer_fee_usdt=settings.cross_exchange_transfer_fee_usdt,
-            local_buffer_php=settings.local_buffer_php,
-            allowed_methods=settings.allowed_methods,
-        )
-        hold_settings = self._p2p_capped_route_settings(hold_settings)
-        entry = build_p2p_hold_entry([self._p2p_last_snapshot], settings=hold_settings)
-        if not entry:
-            self._p2p_status_var.set("Hold buy skipped: not enough buy-side depth.")
-            return
-        state, position = self.p2p_paper.open_hold(
-            entry,
-            target_profit_pct=settings.min_profit_pct,
-            starting_php=settings.capital_php,
-        )
-        self._refresh_p2p_paper_summary(state)
-        if position:
-            warnings = "; ".join(entry.warnings) if entry.warnings else "ok"
-            self._p2p_status_var.set(
-                f"Paper hold opened: {entry.buy_usdt:,.2f} USDT @ "
-                f"{entry.avg_buy_price:,.2f} | Target +{settings.min_profit_pct:.3f}% | {warnings}"
-            )
-            self._send_p2p_paper_event(
-                "Paper Hold Opened",
-                [
-                    f"Bought: <b>{entry.buy_usdt:,.2f} USDT</b>",
-                    f"Cost: <b>{entry.cost_php:,.0f} PHP</b> @ {entry.avg_buy_price:,.2f}",
-                    f"Target: <b>+{settings.min_profit_pct:.3f}% net</b>",
-                    f"Warnings: {tg.escape_html(warnings)}",
-                ],
-            )
-        else:
-            self._p2p_status_var.set("Hold buy skipped: insufficient free cash or open hold exists.")
-
-    def _check_p2p_hold_sell(self):
-        if not self._p2p_last_snapshot:
-            self._refresh_p2p()
-            self._p2p_status_var.set("Loading prices first; press Check / Sell Hold again after refresh.")
-            return
-        self._evaluate_p2p_hold(auto=False)
-
-    def _evaluate_p2p_hold(self, auto: bool):
-        if not self._p2p_last_snapshot:
-            return
-        settings = self._p2p_route_settings()
-        if not settings:
-            return
-        state, _ = self.p2p_paper.sync_starting_capital(settings.capital_php)
-        if not state.get("hold_position"):
-            if not auto:
-                self._p2p_status_var.set("No open P2P hold to evaluate.")
-            self._refresh_p2p_paper_summary(state)
-            return
-
-        state, evaluation = self.p2p_paper.evaluate_hold_exit(
-            [self._p2p_last_snapshot],
-            settings=settings,
-            realism=self._p2p_realism_settings(),
-            starting_php=settings.capital_php,
-        )
-        self._refresh_p2p_paper_summary(state)
-        if not evaluation:
-            if not auto:
-                self._p2p_status_var.set("Hold sell check skipped: not enough sell-side depth.")
-            return
-        if evaluation.exit_ready:
-            source = "Auto hold" if auto else "Hold"
-            self._p2p_status_var.set(
-                f"{source} sold: {evaluation.profit_php:+,.0f} PHP "
-                f"({evaluation.profit_pct:+.3f}%) @ {evaluation.avg_sell_price:,.2f}"
-            )
-            self._send_p2p_paper_event(
-                "Paper Hold Sold",
-                [
-                    f"Sold: <b>{evaluation.sold_usdt:,.2f} USDT</b>",
-                    f"Avg sell: <b>{evaluation.avg_sell_price:,.2f} PHP</b>",
-                    f"Net P&L: <b>{evaluation.profit_php:+,.0f} PHP ({evaluation.profit_pct:+.3f}%)</b>",
-                ],
-            )
-        elif not auto:
-            warnings = "; ".join(evaluation.warnings) if evaluation.warnings else "waiting"
-            self._p2p_status_var.set(
-                f"Hold not sold: {evaluation.profit_php:+,.0f} PHP "
-                f"({evaluation.profit_pct:+.3f}%) vs target "
-                f"+{evaluation.target_profit_pct:.3f}% | {warnings}"
-            )
-
-    def _execute_p2p_paper_cycle(self, auto: bool):
-        if not self._p2p_last_snapshot or not self._p2p_sweep:
-            self._p2p_status_var.set("No depth sweep available for paper cycle.")
-            return
-        settings = self._p2p_route_settings()
-        if not settings:
-            return
-        state, _ = self.p2p_paper.sync_starting_capital(settings.capital_php)
-        if state.get("hold_position"):
-            if not auto:
-                self._p2p_status_var.set(
-                    "Paper Buy+Sell skipped: a P2P hold is open. Sell or reset the hold first."
-                )
-            self._record_decision("p2p", "paper_cycle", "SKIP", 0, "hold position open")
-            self._refresh_p2p_paper_summary(state)
-            return
-        paper_capital = self._num(state.get("cash_php", state.get("balance_php")), settings.capital_php)
-        if paper_capital <= 0:
-            if not auto:
-                self._p2p_status_var.set("Paper cycle skipped: no free PHP paper cash.")
-            return
-        if auto:
-            cooldown = max(60.0, self._p2p_realism_settings().settlement_delay_mins * 60)
-            now = time.time()
-            if now - self._p2p_last_auto_cycle_ts < cooldown:
-                return
-            min_auto_size = max(5_000.0, settings.capital_php * 0.05)
-            if paper_capital < min_auto_size:
-                self._record_decision(
-                    "p2p",
-                    "paper_cycle",
-                    "SKIP",
-                    0,
-                    f"free cash {paper_capital:,.0f} below auto minimum {min_auto_size:,.0f}",
-                )
-                return
-        paper_settings = P2PRouteSettings(
-            capital_php=paper_capital,
-            min_profit_php=settings.min_profit_php,
-            min_profit_pct=settings.min_profit_pct,
-            min_completion_rate=settings.min_completion_rate,
-            min_orders=settings.min_orders,
-            cross_exchange_transfer_fee_usdt=settings.cross_exchange_transfer_fee_usdt,
-            local_buffer_php=settings.local_buffer_php,
-            allowed_methods=settings.allowed_methods,
-        )
-        paper_settings = self._p2p_capped_route_settings(paper_settings)
-        raw_paper_sweep = build_depth_sweep([self._p2p_last_snapshot], settings=paper_settings)
-        paper_sweep = self._apply_p2p_realism(raw_paper_sweep) if raw_paper_sweep else None
-        if not paper_sweep:
-            self._p2p_status_var.set("Paper cycle skipped: not enough depth.")
-            self._record_decision("p2p", "paper_cycle", "SKIP", 0, "not enough depth")
-            return
-        if auto:
-            auto_key = self._p2p_sweep_listing_key(paper_sweep)
-            if auto_key == self._p2p_last_auto_cycle_key:
-                return
-        state, cycle = self.p2p_paper.execute_if_profitable(
-            paper_sweep,
-            min_profit_pct=settings.min_profit_pct,
-            starting_php=settings.capital_php,
-        )
-        self._refresh_p2p_paper_summary(state)
-        if cycle:
-            source = "Auto paper" if auto else "Paper"
-            self._p2p_status_var.set(
-                f"{source} cycle: {cycle.profit_php:+,.0f} PHP | "
-                f"Balance {cycle.balance_after_php:,.0f} PHP"
-            )
-            if auto:
-                self._p2p_last_auto_cycle_key = auto_key
-                self._p2p_last_auto_cycle_ts = time.time()
-            self._record_decision(
-                "p2p",
-                "paper_cycle",
-                "FILLED",
-                100,
-                f"{cycle.profit_php:+,.0f} PHP ({cycle.profit_pct:+.3f}%) realized paper",
-            )
-            self._append_p2p_lifecycle_events(cycle, paper_sweep, "AUTO" if auto else "MANUAL")
-            warnings = "; ".join(cycle.warnings) if cycle.warnings else "ok"
-            self._send_p2p_paper_event(
-                "Paper Buy+Sell Filled",
-                [
-                    f"Size: <b>{cycle.size_php:,.0f} PHP</b>",
-                    f"Avg buy/sell: {cycle.avg_buy_price:,.2f} / {cycle.avg_sell_price:,.2f}",
-                    f"Net P&L: <b>{cycle.profit_php:+,.0f} PHP ({cycle.profit_pct:+.3f}%)</b>",
-                    f"Balance: <b>{cycle.balance_after_php:,.0f} PHP</b>",
-                    f"Warnings: {tg.escape_html(warnings)}",
-                ],
-            )
-        elif not auto:
-            self._record_decision(
-                "p2p",
-                "paper_cycle",
-                "SKIP",
-                0,
-                f"below profit filter after realism: {paper_sweep.profit_php:+,.0f} PHP",
-            )
-            self._p2p_status_var.set("Paper cycle skipped: sweep is below profit filter.")
-
-    def _append_p2p_lifecycle_events(self, cycle, sweep: P2PDepthSweep, source: str):
-        steps = [
-            ("ROUTE_SELECTED", "PLANNED", f"{source} paper route selected"),
-            ("BUY_ORDER", "OPENED", f"{len(sweep.buy_lots)} buy lot(s)"),
-            ("FIAT_PAYMENT", "CONFIRMED", "paper fiat payment confirmed"),
-            ("SELL_ORDER", "OPENED", f"{len(sweep.sell_lots)} sell lot(s)"),
-            ("CRYPTO_RELEASE", "CONFIRMED", "paper crypto release confirmed"),
-            ("PAPER_CYCLE", "COMPLETED", "; ".join(cycle.warnings) if cycle.warnings else "ok"),
-        ]
-        for event_type, status, details in steps:
-            try:
-                self.event_ledger.append(
-                    domain="p2p_lifecycle",
-                    event_type=event_type,
-                    status=status,
-                    amount=cycle.size_php,
-                    currency="PHP",
-                    pnl=cycle.profit_php if status == "COMPLETED" else 0.0,
-                    balance=cycle.balance_after_php if status == "COMPLETED" else 0.0,
-                    symbol_or_route="USDT/PHP",
-                    details=details,
-                    timestamp=cycle.timestamp,
-                )
-            except Exception:
-                pass
-        self._refresh_event_ledger()
-
-    @staticmethod
-    def _p2p_sweep_listing_key(sweep: P2PDepthSweep) -> str:
-        def lot_key(lot):
-            return (
-                lot.side,
-                lot.marketplace,
-                lot.advertiser,
-                f"{lot.price:.4f}",
-            )
-
-        buy_key = tuple(lot_key(lot) for lot in sweep.buy_lots)
-        sell_key = tuple(lot_key(lot) for lot in sweep.sell_lots)
-        return repr((buy_key, sell_key, f"{sweep.avg_buy_price:.4f}", f"{sweep.avg_sell_price:.4f}"))
-
-    def _reset_p2p_paper(self):
-        try:
-            starting_php = float(self._p2p_capital_php.get())
-        except ValueError as exc:
-            self._p2p_status_var.set(f"P2P settings error: {exc}")
-            return
-        state = self.p2p_paper.reset(starting_php)
-        self._refresh_p2p_paper_summary(state)
-        self._p2p_status_var.set(f"P2P paper arb reset to {starting_php:,.0f} PHP.")
-
-    def _refresh_p2p_paper_summary(self, state: dict | None = None):
-        if not hasattr(self, "_p2p_paper_balance_var"):
-            return
-        starting_php = 500_000
-        if hasattr(self, "_p2p_capital_php"):
-            starting_php = self._num(self._p2p_capital_php.get(), 500_000)
-        state = state or self.p2p_paper.state(starting_php)
-        balance = self._num(state.get("balance_php"), 0)
-        cash = self._num(state.get("cash_php"), balance)
-        cycles = state.get("cycles", [])
-        hold_trades = state.get("hold_trades", [])
-        realized = self._num(state.get("realized_profit_php"), 0)
-        hold = state.get("hold_position") or {}
-        self._p2p_paper_balance_var.set(f"{balance:,.0f} PHP")
-        self._p2p_paper_cycles_var.set(f"{len(cycles) + len(hold_trades)} ({realized:+,.0f})")
-        if hold:
-            usdt = self._num(hold.get("usdt"), 0)
-            avg_buy = self._num(hold.get("avg_buy_price"), 0)
-            last_profit = hold.get("last_profit_php")
-            last_pct = hold.get("last_profit_pct")
-            self._p2p_hold_usdt_var.set(f"{usdt:,.2f}")
-            if last_profit is not None and last_pct is not None:
-                self._p2p_hold_pnl_var.set(f"{self._num(last_profit):+,.0f} ({self._num(last_pct):+.3f}%)")
-            else:
-                self._p2p_hold_pnl_var.set(f"@ {avg_buy:,.2f}")
-        else:
-            self._p2p_hold_usdt_var.set("--")
-            self._p2p_hold_pnl_var.set(f"Cash {cash:,.0f}")
-        self._refresh_p2p_transactions(state)
-
-    @staticmethod
-    def _p2p_capital_status(delta: float, message: str) -> str:
-        if abs(delta) < 0.01:
-            return message
-        return f"P2P paper capital adjusted {delta:+,.0f} PHP. {message}"
-
-    def _log_top_p2p_route(self):
-        if not self._p2p_routes:
-            self._p2p_status_var.set("No P2P route to log yet.")
-            return
-
-        route = self._p2p_routes[0]
-        if route.profit_php <= 0:
-            self._p2p_status_var.set("Top P2P route is not profitable, not logged.")
-            return
-        path = self.p2p_journal.append(route, status="WATCHLIST")
-        self._refresh_p2p_journal()
-        self._p2p_status_var.set(f"Logged top P2P route to {path.name}.")
-
-    def _refresh_p2p_journal(self):
-        if hasattr(self, "p2p_journal_tree"):
-            self._fill_p2p_journal_tree(self.p2p_journal_tree, self.p2p_journal.recent(limit=8), 48)
-        if hasattr(self, "p2p_history_journal_tree"):
-            self._fill_p2p_journal_tree(
-                self.p2p_history_journal_tree,
-                self.p2p_journal.recent(limit=100),
-                78,
-            )
-
-    def _refresh_p2p_transactions(self, state: dict | None = None):
-        rows = self._p2p_transaction_rows(state=state, limit=200)
-        if hasattr(self, "p2p_tx_tree"):
-            self._fill_p2p_transactions_tree(self.p2p_tx_tree, rows[-14:], 42)
-        if hasattr(self, "p2p_history_tx_tree"):
-            self._fill_p2p_transactions_tree(self.p2p_history_tx_tree, rows, 78)
-        self._update_p2p_history_summary(state)
-
-    def _refresh_p2p_history_tab(self):
-        self._refresh_p2p_journal()
-        self._refresh_p2p_transactions()
-
-    def _fill_p2p_journal_tree(self, tree, rows, note_limit: int):
-        for item in tree.get_children():
-            tree.delete(item)
-
-        for row in reversed(rows):
-            ts = row.get("timestamp", "")
-            time_text = ts[:16].replace("T", " ")
-            tree.insert("", "end", values=(
-                time_text,
-                row.get("status", ""),
-                row.get("route", ""),
-                f"{self._num(row.get('size_php')):,.0f}",
-                f"{self._num(row.get('expected_profit_php')):+,.0f}",
-                self._clip_text(row.get("notes", "") or row.get("warnings", ""), note_limit),
-            ))
-
-    def _fill_p2p_transactions_tree(self, tree, rows, note_limit: int):
-        for item in tree.get_children():
-            tree.delete(item)
-
-        for row in reversed(rows):
-            ts = row.get("timestamp", "")
-            time_text = ts[:16].replace("T", " ")
-            profit = self._num(row.get("profit_php"), 0.0)
-            tags = ("profit",) if profit > 0 else ("loss",) if profit < 0 else ()
-            tree.insert("", "end", tags=tags, values=(
-                time_text,
-                str(row.get("type", "")).replace("_", " "),
-                row.get("status", ""),
-                f"{self._num(row.get('amount_php')):,.0f}",
-                f"{self._num(row.get('usdt')):,.2f}" if self._num(row.get("usdt")) else "--",
-                f"{profit:+,.0f}" if profit else "--",
-                f"{self._num(row.get('balance_after_php')):,.0f}",
-                self._clip_text(row.get("notes", ""), note_limit),
-            ))
-
-    def _p2p_transaction_rows(self, state: dict | None = None, limit: int = 200) -> list[dict]:
-        if state is not None:
-            return list(state.get("transactions", []))[-limit:]
-        starting_php = 500_000
-        if hasattr(self, "_p2p_capital_php"):
-            starting_php = self._num(self._p2p_capital_php.get(), 500_000)
-        return self.p2p_paper.recent_transactions(limit=limit, starting_php=starting_php)
-
-    def _update_p2p_history_summary(self, state: dict | None = None):
-        if not hasattr(self, "_p2p_history_summary_var"):
-            return
-        starting_php = 500_000
-        if hasattr(self, "_p2p_capital_php"):
-            starting_php = self._num(self._p2p_capital_php.get(), 500_000)
-        state = state or self.p2p_paper.state(starting_php)
-        tx_count = len(state.get("transactions", []))
-        self._p2p_history_summary_var.set(
-            f"Paper balance {self._num(state.get('balance_php')):,.0f} PHP  |  "
-            f"Cash {self._num(state.get('cash_php')):,.0f} PHP  |  "
-            f"Realized {self._num(state.get('realized_profit_php')):+,.0f} PHP  |  "
-            f"{tx_count} transaction(s)  |  CSV: {self.p2p_paper.transaction_path}"
-        )
-
-    def _fill_p2p_tree(self, tree, ads):
-        for item in tree.get_children():
-            tree.delete(item)
-
-        for ad in ads:
-            tree.insert("", "end", values=(
-                f"{ad.price:,.2f}",
-                f"{ad.min_limit:,.0f}-{ad.max_limit:,.0f}",
-                f"{ad.available:,.2f}",
-                self._clip_text(ad.methods_text, 34),
-                self._clip_text(ad.advertiser, 22),
-                self._format_rate(ad.completion_rate),
-                str(ad.orders) if ad.orders is not None else "--",
-            ))
-        tree.yview_moveto(0)
 
     @staticmethod
     def _format_rate(rate: float | None) -> str:
@@ -2709,12 +1330,13 @@ class Dashboard:
         self._s_pretrade_score = tk.StringVar(value=str(round(config.PRE_TRADE_MIN_SCORE, 0)))
         row("Min pre-trade score", lambda p: field(p, self._s_pretrade_score, 8), 10)
 
-        # Monthly contribution
-        self._s_monthly_contribution = tk.StringVar(value=str(round(config.MONTHLY_CONTRIBUTION_USD, 2)))
-        row("Monthly contribution ($)", lambda p: field(p, self._s_monthly_contribution, 8), 11)
-
-        self._s_monthly_day = tk.StringVar(value=str(config.MONTHLY_CONTRIBUTION_DAY))
-        row("Contribution day", lambda p: field(p, self._s_monthly_day, 8), 12)
+        self._s_account_exposure = tk.StringVar(value=str(config.FUTURES_MAX_ACCOUNT_LEVERAGE))
+        row("Account exposure (x)", lambda p: field(p, self._s_account_exposure, 8), 11)
+        self._s_cash_reserve = tk.StringVar(value=str(config.FUTURES_CASH_RESERVE_PCT * 100))
+        row("Cash reserve (%)", lambda p: field(p, self._s_cash_reserve, 8), 12)
+        self._s_exchange = tk.StringVar(value=config.FUTURES_EXCHANGE)
+        row("Futures exchange", lambda p: ttk.Combobox(p, textvariable=self._s_exchange,
+            values=("okx", "binance"), state="readonly", style="Settings.TCombobox", width=10), 15)
 
         self._s_auto_start = tk.BooleanVar(value=config.AUTO_START_FUTURES)
         auto_frame = tk.Frame(grid, bg="#0d1117")
@@ -2752,40 +1374,17 @@ class Dashboard:
         apply_settings_btn.pack(side="left")
         self._tip(apply_settings_btn, "Save settings to .env and apply them to new futures trades. Open trades keep original leverage, margin, TP, and SL.")
         ttk.Label(bf, textvariable=self._s_status, foreground="#3fb950",
-                  background="#0d1117", font=("Consolas", 9)).pack(side="left", padx=12)
+                  background="#0d1117", font=("Consolas", 9), wraplength=510).pack(side="left", padx=12)
 
         ttk.Label(settings_panel,
                   text="Changes apply to new trades only. Open positions keep their original settings.",
                   foreground="#8b949e", background="#0d1117",
                   font=("Consolas", 8)).pack(anchor="w")
 
-        schedule_panel = tk.Frame(body, bg="#0d1117")
-        schedule_panel.pack(side="left", fill="both", expand=True, padx=(28, 0), anchor="n")
-        ttk.Label(schedule_panel, text="12-MONTH CONTRIBUTION PLAN", style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(0, 4))
-
-        self._contrib_summary_var = tk.StringVar(value="")
-        ttk.Label(schedule_panel, textvariable=self._contrib_summary_var,
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 9)).pack(anchor="w", pady=(0, 6))
-
-        contrib_cols = ("month", "due", "amount", "status")
-        self.contrib_tree = ttk.Treeview(
-            schedule_panel, columns=contrib_cols, show="headings", height=12,
-        )
-        for col, heading, width in [
-            ("month", "MONTH", 80),
-            ("due", "DUE", 90),
-            ("amount", "AMOUNT", 80),
-            ("status", "STATUS", 90),
-        ]:
-            self.contrib_tree.heading(col, text=heading)
-            self.contrib_tree.column(col, width=width, anchor="center")
-        self.contrib_tree.tag_configure("paid", foreground="#3fb950")
-        self.contrib_tree.tag_configure("due", foreground="#e3b341")
-        self.contrib_tree.tag_configure("scheduled", foreground="#8b949e")
-        self.contrib_tree.pack(fill="x", anchor="n")
-        self._update_contribution_schedule()
+        self._account_summary_var = tk.StringVar(value="")
+        ttk.Label(body, textvariable=self._account_summary_var, wraplength=370,
+                  foreground="#58a6ff", background="#0d1117", font=("Consolas", 10),
+                  justify="left").pack(side="left", anchor="n", padx=(20, 0))
 
     def _send_ohverlay_test(self):
         previous = config.OHVERLAY_ENABLED
@@ -2807,6 +1406,17 @@ class Dashboard:
             config.OHVERLAY_ENABLED = previous
 
     def _apply_settings(self):
+        if not self._account_lock.acquire(blocking=False):
+            self._s_status.set("Scan is busy. Apply again when the current scan finishes.")
+            return
+        try:
+            self._apply_settings_locked()
+        except (ValueError, OSError) as exc:
+            self._s_status.set(f"Settings not applied: {exc}")
+        finally:
+            self._account_lock.release()
+
+    def _apply_settings_locked(self):
         try:
             capital   = float(self._s_capital.get())
             leverage  = int(self._s_leverage.get())
@@ -2828,21 +1438,28 @@ class Dashboard:
             pretrade_score = float(self._s_pretrade_score.get())
             confirm_rebound = self._s_confirm_rebound.get()
             require_dip = self._s_require_dip.get()
-            monthly_contribution = float(self._s_monthly_contribution.get())
-            monthly_day = int(self._s_monthly_day.get())
+            exposure = float(self._s_account_exposure.get())
+            reserve = float(self._s_cash_reserve.get()) / 100
+            exchange = self._s_exchange.get()
             auto_start = self._s_auto_start.get()
             ohverlay_enabled = self._s_ohverlay_enabled.get()
         except ValueError as e:
             self._s_status.set(f"Error: {e}")
             return
 
-        if capital <= 0:
-            self._s_status.set("Error: capital must be positive")
+        values = [capital, tp_pct, sl_pct, per_trade, exposure, reserve, pretrade_score]
+        if btc_regime_filter is not None:
+            values.append(btc_regime_filter)
+        if not all(math.isfinite(value) for value in values):
+            self._s_status.set("Error: settings must be finite numbers")
+            return
+        if capital <= 0 or tp_pct <= 0 or sl_pct <= 0 or hold_days < 1 or not 0 < per_trade <= 1:
+            self._s_status.set("Error: capital/TP/SL/hold must be positive; per trade must be 0-100%")
             return
         leverage = max(1, min(leverage, config.MAX_LEVERAGE))
         self._s_leverage.set(leverage)
-        if monthly_contribution < 0:
-            self._s_status.set("Error: monthly contribution cannot be negative")
+        if exposure < 0 or not 0 <= reserve < 1 or exchange not in {"okx", "binance"}:
+            self._s_status.set("Error: invalid exposure cap, reserve or exchange")
             return
         if not 1 <= max_open_trades <= config.MAX_OPEN_TRADES_CAP:
             self._s_status.set(f"Error: max open trades must be 1-{config.MAX_OPEN_TRADES_CAP}")
@@ -2850,8 +1467,8 @@ class Dashboard:
         if not 0 <= pretrade_score <= 100:
             self._s_status.set("Error: min pre-trade score must be 0-100")
             return
-        if not 1 <= monthly_day <= 31:
-            self._s_status.set("Error: contribution day must be 1-31")
+        if exchange != config.FUTURES_EXCHANGE and self.trader.get_open_positions():
+            self._s_status.set("Close/reset existing paper trades before changing their price source.")
             return
         try:
             capital_cash_delta = self.trader.starting_capital_delta(capital)
@@ -2882,8 +1499,9 @@ class Dashboard:
             "PRE_TRADE_MIN_SCORE": pretrade_score,
             "PRE_TRADE_CONFIRMATION_ENABLED": "true" if confirm_rebound else "false",
             "FUTURES_REQUIRE_DIP": "true" if require_dip else "false",
-            "MONTHLY_CONTRIBUTION_USD": monthly_contribution,
-            "MONTHLY_CONTRIBUTION_DAY": monthly_day,
+            "FUTURES_MAX_ACCOUNT_LEVERAGE": exposure,
+            "FUTURES_CASH_RESERVE_PCT": reserve,
+            "FUTURES_EXCHANGE": exchange,
             "AUTO_START_FUTURES": "true" if auto_start else "false",
             "OHVERLAY_ENABLED": "true" if ohverlay_enabled else "false",
             "SETTINGS_CONFIRMED": "true",
@@ -2907,8 +1525,13 @@ class Dashboard:
         config.PRE_TRADE_MIN_SCORE = pretrade_score
         config.PRE_TRADE_CONFIRMATION_ENABLED = confirm_rebound
         config.FUTURES_REQUIRE_DIP = require_dip
-        config.MONTHLY_CONTRIBUTION_USD = monthly_contribution
-        config.MONTHLY_CONTRIBUTION_DAY = monthly_day
+        config.FUTURES_MAX_ACCOUNT_LEVERAGE = exposure
+        config.FUTURES_CASH_RESERVE_PCT = reserve
+        if exchange != config.FUTURES_EXCHANGE:
+            config.FUTURES_EXCHANGE = exchange
+            self.trader._client = None
+            self.strategy.basket = []
+            self.strategy.basket_month = None
         config.AUTO_START_FUTURES = auto_start
         config.OHVERLAY_ENABLED = ohverlay_enabled
         config.SETTINGS_CONFIRMED = True
@@ -2932,14 +1555,13 @@ class Dashboard:
             f"Crash: {'GUARD' if crash_entry_guard else 'OFF'}/"
             f"{'SL' if crash_emergency_sl else 'NO-SL'}  |  "
             f"BTC: {'OFF' if btc_regime_filter is None else f'{btc_regime_filter*100:+.2f}%'}  |  "
-            f"Add ${monthly_contribution:.2f}/mo  |  Ohverlay: {'ON' if ohverlay_enabled else 'OFF'}"
+            f"Deposits ${capital:,.2f} | {exchange.upper()} | Ohverlay: {'ON' if ohverlay_enabled else 'OFF'}"
             f"{capital_note}")
         self._refresh_summary()
-        self._update_contribution_schedule()
 
     @staticmethod
     def _new_trade_setting_text() -> str:
-        return f"   NEW TRADES: FUTURES {config.LEVERAGE}x / MAX {config.MAX_OPEN_TRADES}"
+        return f"   {config.FUTURES_EXCHANGE.upper()} PAPER {config.LEVERAGE}x / MAX {config.MAX_OPEN_TRADES}"
 
     @staticmethod
     def _num(value, default: float = 0.0) -> float:
@@ -2996,10 +1618,6 @@ class Dashboard:
             else:
                 break
 
-        try:
-            p2p_state = self.p2p_paper.state(self._p2p_starting_capital_php())
-        except Exception:
-            p2p_state = {}
         backtests = sorted(config.DATA_DIR.glob("backtest*.txt")) if config.DATA_DIR.exists() else []
         try:
             rebound = rebound_analysis.latest_study_summary(config.DATA_DIR)
@@ -3015,8 +1633,6 @@ class Dashboard:
             "daily_pnl": daily_pnl,
             "loss_streak": loss_streak,
             "total_trades": len(closed),
-            "p2p_balance": self._num(p2p_state.get("balance_php")),
-            "p2p_realized": self._num(p2p_state.get("realized_profit_php")),
             "profile": config.BOT_PROFILE,
             "data_dir": str(config.DATA_DIR),
             "backtest_count": len(backtests),
@@ -3045,10 +1661,6 @@ class Dashboard:
             daily_loss = max(0.0, float(self._risk_max_daily_loss.get()))
             exposure = max(0.0, float(self._risk_max_exposure.get()))
             loss_streak = max(0, int(self._risk_max_loss_streak.get()))
-            p2p_max_route = max(0.0, float(self._risk_p2p_max_route.get()))
-            p2p_delay = max(0.0, float(self._p2p_delay_mins.get()))
-            p2p_cancel = max(0.0, float(self._p2p_cancel_rate.get()))
-            p2p_decay = max(0.0, float(self._p2p_spread_decay.get()))
         except ValueError as exc:
             self._risk_action_var.set(f"Error: {exc}")
             return
@@ -3058,20 +1670,12 @@ class Dashboard:
             "RISK_MAX_DAILY_LOSS_USD": daily_loss,
             "RISK_MAX_OPEN_EXPOSURE_USD": exposure,
             "RISK_MAX_LOSS_STREAK": loss_streak,
-            "P2P_MAX_ROUTE_PHP": p2p_max_route,
-            "P2P_SETTLEMENT_DELAY_MINS": p2p_delay,
-            "P2P_CANCEL_RATE_PCT": p2p_cancel,
-            "P2P_SPREAD_DECAY_PCT": p2p_decay,
         })
         old_profile = config.BOT_PROFILE
         config.BOT_PROFILE = profile
         config.RISK_MAX_DAILY_LOSS_USD = daily_loss
         config.RISK_MAX_OPEN_EXPOSURE_USD = exposure
         config.RISK_MAX_LOSS_STREAK = loss_streak
-        config.P2P_MAX_ROUTE_PHP = p2p_max_route
-        config.P2P_SETTLEMENT_DELAY_MINS = p2p_delay
-        config.P2P_CANCEL_RATE_PCT = p2p_cancel
-        config.P2P_SPREAD_DECAY_PCT = p2p_decay
         note = " Applied."
         if profile != old_profile:
             note += " Restart to switch data folder."
@@ -3171,21 +1775,6 @@ class Dashboard:
             "block" if config.RISK_MAX_LOSS_STREAK and snap["loss_streak"] >= config.RISK_MAX_LOSS_STREAK else "ok",
         )
         row("Open margin", f"${snap['open_margin']:,.2f}", "", "TRACK", "ok")
-        row("P2P paper equity", f"{snap['p2p_balance']:,.0f} PHP", "", f"{snap['p2p_realized']:+,.0f} realized", "ok")
-        row(
-            "P2P max route",
-            f"{config.P2P_MAX_ROUTE_PHP:,.0f} PHP" if config.P2P_MAX_ROUTE_PHP else "input capital",
-            "per cycle cap",
-            "ACTIVE" if config.P2P_MAX_ROUTE_PHP else "OFF",
-            "ok",
-        )
-        row(
-            "P2P realism",
-            f"{config.P2P_SETTLEMENT_DELAY_MINS:.0f}m delay | {config.P2P_CANCEL_RATE_PCT:.1f}% cancel | {config.P2P_SPREAD_DECAY_PCT:.3f}% decay",
-            "paper buffer",
-            "ACTIVE",
-            "warn",
-        )
         rebound = snap.get("rebound") or {}
         if rebound:
             row(
@@ -3334,7 +1923,6 @@ class Dashboard:
         snap = self._risk_snapshot()
         stats = self.trader.get_stats()
         allowed, reasons = self._risk_allows_trading()
-        p2p_state = self.p2p_paper.state(self._p2p_starting_capital_php())
         ledger_rows = self.event_ledger.recent(limit=25)
         decisions = self._decision_log[-25:]
         generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -3362,12 +1950,6 @@ class Dashboard:
                 f"  Rebound report: {rebound.get('report_path')}",
             ])
         lines.extend([
-            "",
-            "P2P Paper",
-            f"  Balance: {self._num(p2p_state.get('balance_php')):,.0f} PHP",
-            f"  Cash: {self._num(p2p_state.get('cash_php')):,.0f} PHP",
-            f"  Realized: {self._num(p2p_state.get('realized_profit_php')):+,.0f} PHP",
-            f"  Transactions: {len(p2p_state.get('transactions', []))}",
             "",
             "Recent Decisions",
         ])
@@ -3398,10 +1980,6 @@ class Dashboard:
             self._draw_charts()
         elif tab == "History":
             self._refresh_history()
-        elif tab == "P2P Arb" and self._p2p_last_snapshot is None:
-            self._refresh_p2p()
-        elif tab == "P2P History":
-            self._refresh_p2p_history_tab()
         elif tab == "Ledger":
             self._refresh_event_ledger()
 
@@ -3443,7 +2021,8 @@ class Dashboard:
         self._paused = not self._paused
         if self._paused:
             self.pause_btn.config(text="Resume")
-            self.status_var.set("Paused")
+            self._force_event.set()
+            self.status_var.set("Entries paused; existing positions are still monitored.")
             self._record_decision("futures", "pause", "BLOCK", 0, "manual pause")
         else:
             self.pause_btn.config(text="Pause")
@@ -3456,6 +2035,29 @@ class Dashboard:
     def _start_trading_loop(self):
         self._cycle_thread = threading.Thread(target=self._trading_loop, daemon=True)
         self._cycle_thread.start()
+
+    def _run_guarded_cycle(self):
+        with self._account_lock:
+            allowed, reasons = self._risk_allows_trading()
+            one_shot = self._one_shot_requested
+            self._one_shot_requested = False
+            if self._paused and not one_shot:
+                allowed, reasons = False, ["entries paused"]
+            if not self._settings_confirmed:
+                allowed, reasons = False, ["settings not confirmed"]
+            if not allowed:
+                closed = self.trader.check_positions()
+                return {"timestamp": datetime.now(timezone.utc).isoformat(),
+                        "positions_opened": 0, "positions_closed": len(closed),
+                        "risk_blocked": True, "risk_reasons": reasons}
+            summary = self.strategy.run_cycle()
+            self._record_decision("futures", "cycle", "RUN", 80,
+                f"opened {summary.get('positions_opened', 0)} closed {summary.get('positions_closed', 0)} "
+                f"prewait {summary.get('pre_trade_wait', 0)}")
+            for row in summary.get("pre_trade_decisions", [])[-12:]:
+                self._record_decision("futures", f"pretrade {row.get('symbol', '')}",
+                    row.get("decision", "WAIT"), self._num(row.get("score")), row.get("reason", ""))
+            return summary
 
     def _trading_loop(self):
         from bot.modules import telegram_notifier as tg
@@ -3470,8 +2072,9 @@ class Dashboard:
         last_summary_day = now.day  # send daily summary once per day
 
         while self._running:
-            if self._paused:
-                time.sleep(1)
+            if self._paused and not self._one_shot_requested and not self.trader.get_open_positions():
+                self._force_event.wait(timeout=1)
+                self._force_event.clear()
                 continue
 
             now_ts = time.time()
@@ -3481,45 +2084,18 @@ class Dashboard:
 
             # Full cycle every 5 min: check positions + scan dips + fill empty slots
             try:
-                allowed, reasons = self._risk_allows_trading()
-                if not allowed:
-                    closed = self.trader.check_positions()
-                    summary = {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "basket_refreshed": False,
-                        "cash_contributed": 0.0,
-                        "dips_found": 0,
-                        "positions_opened": 0,
-                        "positions_closed": len(closed),
-                        "slots_filled": 0,
-                        "risk_blocked": True,
-                        "risk_reasons": reasons,
-                    }
-                    self._record_decision("risk", "cycle", "BLOCK", 0, "; ".join(reasons))
-                else:
-                    summary = self.strategy.run_cycle()
-                    self._record_decision(
-                        "futures",
-                        "cycle",
-                        "RUN",
-                        80,
-                        f"dips {summary.get('dips_found', 0)} opened {summary.get('positions_opened', 0)} "
-                        f"filled {summary.get('slots_filled', 0)} closed {summary.get('positions_closed', 0)} "
-                        f"prewait {summary.get('pre_trade_wait', 0)}",
-                    )
-                    for row in summary.get("pre_trade_decisions", [])[-12:]:
-                        self._record_decision(
-                            "futures",
-                            f"pretrade {row.get('symbol', '')}",
-                            row.get("decision", "WAIT"),
-                            self._num(row.get("score")),
-                            row.get("reason", ""),
-                        )
+                summary = self._run_guarded_cycle()
                 self._last_cycle_time    = datetime.now(timezone.utc)
                 self._last_cycle_summary = summary
                 self._next_cycle_ts      = now_ts + scan_interval
+                if self._bridge_scan_id and self._bridge:
+                    self._bridge.complete(self._bridge_scan_id, summary=summary)
+                    self._bridge_scan_id = None
             except Exception:
                 logger.exception("Error in trading cycle")
+                if self._bridge_scan_id and self._bridge:
+                    self._bridge.complete(self._bridge_scan_id, "failed", error="Scan failed; consult private logs")
+                    self._bridge_scan_id = None
 
             # Record equity snapshot
             try:
@@ -3568,8 +2144,15 @@ class Dashboard:
             self._update_positions()
             self._update_closed()
             self._update_basket()
-            self._update_contribution_schedule()
-            self._maybe_refresh_p2p_tab()
+            if hasattr(self, "_account_summary_var"):
+                self._account_summary_var.set(
+                    f"PAPER ACCOUNT\n\nDeposits: ${self.trader.get_contributed_capital():,.2f}\n"
+                    f"Free cash: ${self.trader.cash_balance:,.2f}\n"
+                    f"Net equity: ${self.trader.get_equity_breakdown()['estimated_net_equity_usd']:,.2f}\n\n"
+                    f"{config.FUTURES_EXCHANGE.upper()} / CROSS\n"
+                    f"Exposure cap: {config.FUTURES_MAX_ACCOUNT_LEVERAGE:g}x account\n"
+                    f"Cash reserve: {config.FUTURES_CASH_RESERVE_PCT:.0%}\n\n"
+                    f"LUM bridge: {'CONNECTED' if self._bridge else 'OFF'}")
             if hasattr(self, "notebook"):
                 tab = self.notebook.tab(self.notebook.select(), "text").strip()
                 if tab == "Risk":
@@ -3577,17 +2160,6 @@ class Dashboard:
         except Exception:
             logger.debug("Dashboard refresh error", exc_info=True)
 
-    def _maybe_refresh_p2p_tab(self):
-        if self._p2p_refreshing:
-            return
-        if not hasattr(self, "notebook") or not hasattr(self, "_p2p_status_var"):
-            return
-        try:
-            tab = self.notebook.tab(self.notebook.select(), "text").strip()
-        except tk.TclError:
-            return
-        if tab == "P2P Arb" and time.time() >= self._p2p_next_refresh_ts:
-            self._refresh_p2p()
 
     def _update_clock(self):
         self.clock_label.config(
@@ -3598,7 +2170,7 @@ class Dashboard:
             self.status_var.set("First run: review Settings and click Apply Settings before trading.")
             return
         if self._paused:
-            self.status_var.set("Paused. Press Resume to start futures paper trading.")
+            self.status_var.set("Entries paused. Existing exposure is monitored; Resume enables new entries.")
             return
         allowed, reasons = self._risk_allows_trading()
         if not allowed:
@@ -3717,44 +2289,80 @@ class Dashboard:
         else:
             self.basket_var.set("Basket: waiting for first cycle...")
 
-    def _update_contribution_schedule(self):
-        if not hasattr(self, "contrib_tree"):
+    def _start_local_bridge(self):
+        if not config.LOCAL_BRIDGE_ENABLED:
             return
+        try:
+            self._bridge = LocalBridge(config.DATA_DIR, config.LOCAL_BRIDGE_PORT)
+            logger.info("LUM paper control bridge listening on %s", self._bridge.url)
+            self.root.after(300, self._pump_local_bridge)
+        except OSError:
+            logger.exception("Local bridge unavailable; no remote controls enabled")
 
-        for item in self.contrib_tree.get_children():
-            self.contrib_tree.delete(item)
+    def _pump_local_bridge(self):
+        if not self._running or not self._bridge:
+            return
+        try:
+            operation = self._bridge.commands.get_nowait()
+        except queue.Empty:
+            operation = None
+        if operation:
+            action, operation_id = operation["action"], operation["id"]
+            allowed, reasons = self._risk_allows_trading()
+            if action != "pause" and (not self._settings_confirmed or not allowed):
+                self._bridge.complete(operation_id, "rejected", error="Settings/risk guard blocks entries", reasons=reasons)
+            elif action == "pause":
+                self._paused = True
+                self.pause_btn.config(text="Resume")
+                self._force_event.set()
+                self._bridge.complete(operation_id, entries_paused=True)
+            elif action == "resume":
+                self._paused = False
+                self.pause_btn.config(text="Pause")
+                self._force_event.set()
+                self._bridge.complete(operation_id, entries_paused=False)
+            elif self._bridge_scan_id or not self._account_lock.acquire(blocking=False):
+                self._bridge.complete(operation_id, "rejected", error="A scan or account operation is busy")
+            else:
+                try:
+                    self._bridge_scan_id = operation_id
+                    self._one_shot_requested = True
+                    self._bridge.complete(operation_id, "running")
+                    self._force_event.set()
+                finally:
+                    self._account_lock.release()
+            self._record_decision("bridge", action, "REQUEST", 0, f"LUM local operation {operation_id}")
+        if self._account_lock.acquire(blocking=False):
+            try:
+                self._bridge.publish(self._bridge_snapshot())
+            finally:
+                self._account_lock.release()
+        self.root.after(300, self._pump_local_bridge)
 
-        rows = accounting.contribution_schedule(months=12)
-        paid_count = 0
-        due_count = 0
-        total_planned = 0.0
-        for row in rows:
-            status = row["status"]
-            amount = self._num(row["amount_usd"])
-            paid_count += 1 if status == "paid" else 0
-            due_count += 1 if status == "due" else 0
-            total_planned += amount
-            self.contrib_tree.insert("", "end", values=(
-                row["month"],
-                row["date"],
-                f"${amount:,.2f}",
-                status.upper(),
-            ), tags=(status,))
-
-        if rows:
-            amount = self._num(rows[0]["amount_usd"])
-            day = config.MONTHLY_CONTRIBUTION_DAY
-            self._contrib_summary_var.set(
-                f"${amount:,.2f}/month on day {day}  |  "
-                f"{paid_count}/12 paid  |  {due_count} due  |  "
-                f"12-mo plan ${total_planned:,.2f}"
-            )
+    def _bridge_snapshot(self):
+        trader = self.trader
+        return {"ready": True, "mode": "paper", "live_orders_enabled": False,
+                "exchange": config.FUTURES_EXCHANGE, "entries_paused": self._paused,
+                "deposits_usd": trader.get_contributed_capital(), "cash_usd": trader.cash_balance,
+                "equity": trader.get_equity_breakdown(), "stats": trader.get_stats(),
+                "last_cycle": self._last_cycle_summary, "max_open_trades": config.MAX_OPEN_TRADES,
+                "exposure_cap_x": config.FUTURES_MAX_ACCOUNT_LEVERAGE,
+                "open_positions": [{"symbol": p.symbol, "leverage": p.leverage,
+                    "mark_updated_at": p.mark_updated_at,
+                    "margin_usd": p.margin_used, **trader.estimate_position_pnl(p)}
+                    for p in trader.get_open_positions()],
+                "history": [{"symbol": p.symbol, "pnl_usd": p.pnl_usd, "reason": p.status.value,
+                    "closed_at": p.exit_time.isoformat() if p.exit_time else None}
+                    for p in trader.get_trade_history()[-50:]],
+                "p2p": {"enabled": False, "reason": "Retired; preserved local audit only"}}
 
     def _on_close(self):
         self._running = False
         self._force_event.set()
         if self._telegram_commands:
             self._telegram_commands.stop()
+        if self._bridge:
+            self._bridge.close()
         self.root.destroy()
 
     def run(self):

@@ -49,8 +49,8 @@ class TestFuturesTrader(unittest.TestCase):
         config.BREAK_EVEN_TRIGGER_PCT = 0.005
         config.LOSS_COOLDOWN_HOURS = 24
         config.TP_COOLDOWN_HOURS = 1
-        config.MONTHLY_CONTRIBUTION_USD = 0
-        config.MONTHLY_CONTRIBUTION_DAY = 1
+        config.FUTURES_MAX_ACCOUNT_LEVERAGE = 0
+        config.FUTURES_CASH_RESERVE_PCT = 0
         config.PRE_TRADE_BREAKDOWN_GUARD_ENABLED = True
         config.PRE_TRADE_CONFIRMATION_ENABLED = False
         config.PRE_TRADE_MAX_24H_DROP_PCT = 8.0
@@ -219,29 +219,9 @@ class TestFuturesTrader(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.trader.sync_starting_capital(100)
 
-    def test_monthly_contribution_applies_once_per_month(self):
-        config.MONTHLY_CONTRIBUTION_USD = 100
-        config.MONTHLY_CONTRIBUTION_DAY = 1
-        may_first = datetime(2026, 5, 1, tzinfo=timezone.utc)
-
-        self.assertEqual(self.trader.apply_monthly_contribution(may_first), 100)
-        self.assertAlmostEqual(self.trader.cash_balance, 10100)
-        self.assertEqual(self.trader.apply_monthly_contribution(may_first), 0)
-        self.assertAlmostEqual(self.trader.cash_balance, 10100)
-        self.assertAlmostEqual(self.trader.get_contributed_capital(), 10100)
-
-    def test_monthly_contribution_applies_after_due_day(self):
-        config.MONTHLY_CONTRIBUTION_USD = 100
-        config.MONTHLY_CONTRIBUTION_DAY = 1
-        may_tenth = datetime(2026, 5, 10, tzinfo=timezone.utc)
-
-        self.assertEqual(self.trader.apply_monthly_contribution(may_tenth), 100)
-        self.assertAlmostEqual(self.trader.cash_balance, 10100)
-
     def test_reset_paper_account_archives_and_starts_new_history(self):
-        config.MONTHLY_CONTRIBUTION_USD = 100
-        config.MONTHLY_CONTRIBUTION_DAY = 1
-        self.trader.apply_monthly_contribution(datetime(2026, 5, 1, tzinfo=timezone.utc))
+        audit = {"total_contributed_usd": 100, "contributions": [{"month": "2026-05", "amount_usd": 100}]}
+        (config.DATA_DIR / "account_state.json").write_text(json.dumps(audit), encoding="utf-8")
 
         with patch.object(self.trader, "get_current_price", return_value=100.0):
             closed_seed = self.trader.open_position("ETH", margin_usd=1000)
@@ -259,7 +239,7 @@ class TestFuturesTrader(unittest.TestCase):
         self.assertFalse(_history_csv().exists())
         self.assertEqual(self.trader.get_trade_history(), [])
         self.assertEqual(self.trader.get_open_positions(), [])
-        self.assertAlmostEqual(self.trader.cash_balance, 10100)
+        self.assertAlmostEqual(self.trader.cash_balance, 10000)
 
         archive_dir = config.DATA_DIR / "futures_sessions" / summary["session_id"]
         self.assertTrue((archive_dir / "trade_history.csv").exists())
@@ -267,28 +247,13 @@ class TestFuturesTrader(unittest.TestCase):
 
         saved_open = json.loads(_open_positions_json().read_text(encoding="utf-8"))
         self.assertEqual(saved_open["positions"], [])
-        self.assertAlmostEqual(saved_open["cash_balance"], 10100)
+        self.assertAlmostEqual(saved_open["cash_balance"], 10000)
+        self.assertEqual(accounting.load_account_state(), audit)
 
         sessions = recent_reset_sessions(limit=1)
         self.assertEqual(sessions[-1]["session_id"], summary["session_id"])
         self.assertEqual(int(sessions[-1]["archived_closed_trades"]), 1)
         self.assertEqual(int(sessions[-1]["archived_open_positions"]), 1)
-
-    def test_contribution_schedule_marks_one_year(self):
-        config.MONTHLY_CONTRIBUTION_USD = 100
-        config.MONTHLY_CONTRIBUTION_DAY = 31
-        now = datetime(2026, 2, 28, tzinfo=timezone.utc)
-
-        self.assertEqual(self.trader.apply_monthly_contribution(now), 100)
-        rows = accounting.contribution_schedule(months=12, now=now)
-
-        self.assertEqual(len(rows), 12)
-        self.assertEqual(rows[0]["month"], "2026-02")
-        self.assertEqual(rows[0]["date"], "2026-02-28")
-        self.assertEqual(rows[0]["status"], "paid")
-        self.assertEqual(rows[1]["month"], "2026-03")
-        self.assertEqual(rows[1]["date"], "2026-03-31")
-        self.assertEqual(rows[1]["status"], "scheduled")
 
     def test_no_duplicate(self):
         with patch.object(self.trader, "get_current_price", return_value=100.0):
