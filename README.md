@@ -6,7 +6,7 @@ No live orders, fiat payments, withdrawals or transfers are implemented.
 
 ## Windows Build
 
-The newest successful build is in GitHub **Actions > Build TradingBot23 App >
+The newest successful build is in GitHub **Actions > Build TradingBot23.exe >
 Artifacts > TradingBot23-Windows**. Extract the ZIP and run `TradingBot23.exe`.
 Release downloads change only when a release is published, not on every push.
 First launch starts paused until Settings are confirmed. Keep your private
@@ -118,3 +118,12 @@ Use `.env.example` as the configuration reference. The web draft uses a separate
 private account directory with authenticated access, not the desktop bridge.
 Public hosting is not configured. Historical backtests do not validate the new
 OKX paper workflow; do not interpret them as a promise of future returns.
+
+## UI Foundation
+
+Desktop and web share the Trade23 mark, neutral surfaces and restrained mint
+accent. The native window, taskbar and EXE use the custom icon, not Tk's feather.
+The web dashboard switches from desktop tables to readable trade rows on phones
+and has touch-sized navigation. `/about` is a local product-page foundation,
+not a published website. Its clearly marked preview images use disposable test
+data, never the personal account. See [UI_DESIGN.md](docs/UI_DESIGN.md).

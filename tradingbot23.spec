@@ -7,6 +7,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('.env.example', '.'),
+        ('assets/ui', 'assets/ui'),
     ],
     hiddenimports=[
         'bot',

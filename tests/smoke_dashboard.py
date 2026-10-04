@@ -24,16 +24,19 @@ def run():
         config.TELEGRAM_BOT_TOKEN = ""
         config.TELEGRAM_CHAT_ID = ""
         config.OHVERLAY_ENABLED = False
+        config.FUTURES_EXCHANGE = "okx"
         with (patch.object(Dashboard, "_start_trading_loop"),
               patch.object(Dashboard, "_start_telegram_dashboard"),
               patch.object(Dashboard, "_schedule_refresh")):
             app = Dashboard(Strategy(trader=FuturesTrader()))
             try:
-                for size in ("1100x720", "1280x840"):
+                assert app.root.title() == "Trade23"
+                assert [img.width() for img in app.root._trade23_icon_images] == [32, 64, 256]
+                for size in ("960x640", "1100x720", "1280x840"):
                     app.root.geometry(size)
                     app.notebook.select(app.settings_tab)
                     app.root.update()
-                    app._update_stats()
+                    app._refresh_ui()
                     assert "Realized $+0.00" in app.profit_breakdown_var.get()
                     assert "Open net est." in app.profit_breakdown_var.get()
                     assert app._s_require_dip.get()
@@ -42,6 +45,8 @@ def run():
                     assert not any("P2P" in label for label in tabs)
                     assert not hasattr(app, "contrib_tree")
                     assert not hasattr(app, "p2p_monitor")
+                    assert "READY" not in app._account_summary_var.get()
+                    assert "OFF" in app._account_summary_var.get()
                     parent = app.settings_tab
                     canvas = next(w for w in parent.winfo_children() if w.winfo_class() == "Canvas")
                     canvas.yview_moveto(1)
@@ -65,9 +70,16 @@ def run():
                     assert "Expectancy" in app._hist_metrics_var.get()
                     print(f"UI PASS {size}: settings scroll, Apply Settings reachable, History metrics render")
                 # PrintWindow targets the app even when another window covers it.
+                app.root.geometry("1100x720+8+8")
+                app.root.update()
                 hwnd = ctypes.windll.user32.GetAncestor(app.root.winfo_id(), 2)
                 output = Path("build/ui-entry-quality-history.png")
                 output.parent.mkdir(exist_ok=True)
+                ImageGrab.grab(window=hwnd).save(output)
+                print(f"Screenshot: {output.resolve()}")
+                app.notebook.select(0)
+                app.root.update()
+                output = Path("build/ui-trade23-open.png")
                 ImageGrab.grab(window=hwnd).save(output)
                 print(f"Screenshot: {output.resolve()}")
                 app.notebook.select(app.settings_tab)

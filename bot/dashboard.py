@@ -20,6 +20,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv as _csv
 
 from bot import config
+from bot.ui_theme import (BG, MUTED, FONT, SUCCESS, DANGER, configure_styles,
+                          apply_window_brand, asset_path)
 import rebound_duration_analysis as rebound_analysis
 from bot.modules.local_bridge import LocalBridge
 from bot.modules import ohverlay_notifier as ov
@@ -43,6 +45,8 @@ class ToolTip:
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<FocusIn>", self._schedule, add="+")
+        widget.bind("<FocusOut>", self._hide, add="+")
 
     def _schedule(self, _event=None):
         self._cancel()
@@ -73,16 +77,22 @@ class ToolTip:
             self._window,
             text=self.text,
             justify="left",
-            bg="#21262d",
-            fg="#f0f6fc",
+            bg="#24282c",
+            fg="#f5f7f8",
             relief="solid",
             bd=1,
             padx=9,
             pady=7,
             wraplength=self.wraplength,
-            font=("Consolas", 9),
+            font=(FONT, 9),
         )
         label.pack()
+        self._window.update_idletasks()
+        width, height = self._window.winfo_reqwidth(), self._window.winfo_reqheight()
+        x = max(8, min(x, self.widget.winfo_screenwidth() - width - 8))
+        if y + height > self.widget.winfo_screenheight() - 8:
+            y = max(8, self.widget.winfo_rooty() - height - 8)
+        self._window.wm_geometry(f"+{x}+{y}")
 
     def _hide(self, _event=None):
         self._cancel()
@@ -163,9 +173,11 @@ class Dashboard:
         self._equity_lock = threading.Lock()
 
         self.root = tk.Tk()
-        self.root.title("TradingBot23")
-        self.root.geometry("1280x840")
-        self.root.minsize(1100, 720)
+        self.root.title("Trade23")
+        width = min(1280, self.root.winfo_screenwidth() - 64)
+        height = min(840, self.root.winfo_screenheight() - 96)
+        self.root.geometry(f"{width}x{height}+24+16")
+        self.root.minsize(min(960, width), min(640, height))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
@@ -185,192 +197,139 @@ class Dashboard:
         return widget
 
     def _build_ui(self):
-        self.root.configure(bg="#0d1117")
+        configure_styles(self.root)
+        apply_window_brand(self.root)
+        self._icons = {name: tk.PhotoImage(master=self.root, file=str(asset_path(path)))
+            for name, path in {
+                "brand": "ui/mark-40.png", "play": "ui/play-light.png",
+                "run": "ui/play-dark.png", "pause": "ui/pause-light.png",
+                "send": "ui/send-light.png", "refresh": "ui/refresh-light.png",
+                "download": "ui/download-light.png", "reset": "ui/reset-light.png",
+                "save": "ui/save-dark.png",
+            }.items()}
 
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(".", background="#0d1117", foreground="#c9d1d9", font=("Consolas", 10))
-        style.configure("Header.TLabel", font=("Consolas", 11, "bold"),
-                        foreground="#c9d1d9", background="#0d1117")
-        style.configure("Big.TLabel",   font=("Consolas", 22, "bold"),
-                        foreground="#58a6ff", background="#0d1117")
-        style.configure("Mode.TLabel",  font=("Consolas", 14, "bold"), background="#0d1117")
-        style.configure("Treeview", background="#161b22", foreground="#c9d1d9",
-                        fieldbackground="#161b22", font=("Consolas", 9), rowheight=22)
-        style.configure("Treeview.Heading", background="#21262d", foreground="#8b949e",
-                        font=("Consolas", 9, "bold"))
-        style.map("Treeview", background=[("selected", "#1f6feb")])
-        style.configure("Btn.TButton", font=("Consolas", 9, "bold"), padding=4)
-        style.configure("TNotebook",         background="#0d1117", borderwidth=0)
-        style.configure("TNotebook.Tab",     background="#161b22", foreground="#8b949e",
-                        padding=[12, 4], font=("Consolas", 9, "bold"))
-        style.map("TNotebook.Tab",
-                  background=[("selected", "#0d1117")],
-                  foreground=[("selected", "#58a6ff")])
-        style.configure(
-            "Settings.TEntry",
-            fieldbackground="#f0f6fc",
-            foreground="#0d1117",
-            insertcolor="#0d1117",
-            bordercolor="#8b949e",
-            lightcolor="#f0f6fc",
-            darkcolor="#8b949e",
-        )
-        style.map(
-            "Settings.TEntry",
-            fieldbackground=[("disabled", "#30363d"), ("readonly", "#f0f6fc"), ("focus", "#ffffff")],
-            foreground=[("disabled", "#8b949e"), ("readonly", "#0d1117"), ("focus", "#0d1117")],
-        )
-        style.configure(
-            "Settings.TCombobox",
-            fieldbackground="#f0f6fc",
-            background="#f0f6fc",
-            foreground="#0d1117",
-            arrowcolor="#0d1117",
-            bordercolor="#8b949e",
-            selectbackground="#c9d1d9",
-            selectforeground="#0d1117",
-        )
-        style.map(
-            "Settings.TCombobox",
-            fieldbackground=[("readonly", "#f0f6fc"), ("focus", "#ffffff")],
-            foreground=[("readonly", "#0d1117"), ("focus", "#0d1117")],
-            background=[("readonly", "#f0f6fc"), ("focus", "#ffffff")],
-        )
-        self.root.option_add("*TCombobox*Listbox.background", "#f0f6fc")
-        self.root.option_add("*TCombobox*Listbox.foreground", "#0d1117")
-        self.root.option_add("*TCombobox*Listbox.selectBackground", "#58a6ff")
-        self.root.option_add("*TCombobox*Listbox.selectForeground", "#0d1117")
-
-        # ── Top bar ──
-        top = tk.Frame(self.root, bg="#0d1117", pady=8, padx=15)
+        top = tk.Frame(self.root, bg=BG, padx=24, pady=16)
         top.pack(fill="x")
-
-        mode_text  = "FUTURES PAPER"
-        mode_color = "#3fb950"
-        self.mode_label = ttk.Label(top, text=f"  {mode_text}  ",
-                                    style="Mode.TLabel", foreground=mode_color)
-        self.mode_label.pack(side="left")
-
+        tk.Label(top, image=self._icons["brand"], bg=BG).pack(side="left", padx=(0, 12))
+        brand = tk.Frame(top, bg=BG)
+        brand.pack(side="left")
+        ttk.Label(brand, text="Trade23", font=(FONT, 18, "bold")).pack(anchor="w")
         self.engine_var = tk.StringVar(value=self._new_trade_setting_text())
-        ttk.Label(top, textvariable=self.engine_var, style="Header.TLabel",
-                  foreground="#8b949e").pack(side="left")
-
-        self.clock_label = ttk.Label(top, text="", style="Header.TLabel", foreground="#8b949e")
+        ttk.Label(brand, textvariable=self.engine_var, foreground=MUTED,
+                  font=(FONT, 9)).pack(anchor="w")
+        self.clock_label = ttk.Label(top, text="", foreground=MUTED, font=(FONT, 9))
         self.clock_label.pack(side="right")
+        self.mode_label = ttk.Label(top, text="PAPER", style="Mode.TLabel")
+        self.mode_label.pack(side="right", padx=(0, 22))
+        self._tip(self.mode_label, "Paper simulation only. No real exchange orders are enabled.")
 
-        # ── Control bar ──
-        ctrl = tk.Frame(self.root, bg="#161b22", padx=15, pady=6)
+        ctrl = tk.Frame(self.root, bg=BG, padx=24, pady=4)
         ctrl.pack(fill="x")
+        self.run_btn = ttk.Button(ctrl, text="Run Now", image=self._icons["run"],
+                                  compound="left", style="Primary.TButton", command=self._on_run_now)
+        self.pause_btn = ttk.Button(ctrl, text="Resume" if self._paused else "Pause",
+            image=self._icons["play" if self._paused else "pause"], compound="left",
+            style="Btn.TButton", command=self._on_pause_resume)
+        self.run_btn.pack(side="left", padx=(0, 8))
+        self.pause_btn.pack(side="left", padx=(0, 8))
+        self._tip(self.run_btn, "Request one guarded paper scan. Exits are checked first; entries still require fresh data and risk approval.")
+        self._tip(self.pause_btn, "Pause stops new entries while existing positions are monitored for exits. Resume enables scheduled scans.")
+        tg_menu_btn = ttk.Button(ctrl, image=self._icons["send"], width=3,
+                                style="Btn.TButton", command=self._send_telegram_menu)
+        tg_menu_btn.pack(side="left")
+        self._tip(tg_menu_btn, "Send the dashboard menu to your configured Telegram chat.")
+        self._run_state_var = tk.StringVar(value="Paused" if self._paused else "Running")
+        ttk.Label(ctrl, textvariable=self._run_state_var, foreground=MUTED,
+                  font=(FONT, 9)).pack(side="right")
 
-        self.run_btn   = ttk.Button(ctrl, text="Run Now",    style="Btn.TButton", command=self._on_run_now)
-        pause_text = "Resume" if self._paused else "Pause"
-        self.pause_btn = ttk.Button(ctrl, text=pause_text,    style="Btn.TButton", command=self._on_pause_resume)
-        self.run_btn.pack(side="left", padx=(0, 6))
-        self.pause_btn.pack(side="left", padx=(0, 12))
-        self._tip(self.run_btn, "Run one futures scan immediately: check exits first, then scan for eligible entries if risk guards allow.")
-        self._tip(self.pause_btn, "Pause blocks new futures cycles. Resume allows the loop to scan again if Settings and Risk checks pass.")
-        tg_menu_btn = ttk.Button(ctrl, text="Telegram Menu", style="Btn.TButton",
-                                 command=self._send_telegram_menu)
-        tg_menu_btn.pack(side="left", padx=(0, 12))
-        self._tip(tg_menu_btn, "Send the Telegram dashboard/menu buttons to your configured bot chat.")
+        initial = ("Review Settings before starting." if not self._settings_confirmed
+                   else "Entries paused." if self._paused else "Starting...")
+        self.status_var = tk.StringVar(value=initial)
+        status_frame = tk.Frame(self.root, bg=BG, height=44)
+        status_frame.pack(fill="x")
+        status_frame.pack_propagate(False)
+        status_label = ttk.Label(status_frame, textvariable=self.status_var, foreground=MUTED,
+                                 font=(FONT, 9), padding=(24, 8))
+        status_label.pack(fill="both", expand=True)
+        status_label.bind("<Configure>", lambda e: status_label.configure(wraplength=max(100, e.width - 48)))
+        ttk.Separator(self.root).pack(fill="x", padx=24)
 
-        if not self._settings_confirmed:
-            initial_status = "First run: review Settings and click Apply Settings before trading."
-        elif self._paused:
-            initial_status = "Paused on launch. Press Resume to start futures paper trading."
-        else:
-            initial_status = "Starting up..."
-        self.status_var = tk.StringVar(value=initial_status)
-        ttk.Label(ctrl, textvariable=self.status_var, foreground="#8b949e",
-                  background="#161b22", font=("Consolas", 9)).pack(side="left")
-
-        # ── Stats cards ──
-        stats_frame = tk.Frame(self.root, bg="#0d1117", padx=15, pady=4)
+        stats_frame = tk.Frame(self.root, bg=BG, padx=24, pady=18)
         stats_frame.pack(fill="x")
-
         self.portfolio_var = tk.StringVar(value="$0.00")
-        self.cash_var      = tk.StringVar(value="$0.00")
-        self.pnl_var       = tk.StringVar(value="+0.00%")
-        self.trades_var    = tk.StringVar(value="0")
-        self.winrate_var   = tk.StringVar(value="0.0%")
-        self.open_var      = tk.StringVar(value="0")
-        stats_help = {
-            "NET EQUITY": "Estimated futures paper equity if all open positions closed at cached prices, after modeled exit fees and funding. Entry fees have already been paid. Not an exchange-exact liquidation balance.",
-            "CASH": "Free paper cash/margin available for new futures trades.",
-            "PNL": "Portfolio performance versus contributed futures paper capital, including unrealized open P&L.",
-            "OPEN": "Number of currently open futures paper positions.",
-            "TRADES": "Closed futures paper trades in the active session/history.",
-            "WIN RATE": "Percent of closed futures trades with positive net P&L. Open losing trades are not counted until closed.",
-        }
-
-        for label_text, var, sty in [
-            ("NET EQUITY", self.portfolio_var, "Big.TLabel"),
-            ("CASH",      self.cash_var,      "Header.TLabel"),
-            ("PNL",       self.pnl_var,       "Header.TLabel"),
-            ("OPEN",      self.open_var,       "Header.TLabel"),
-            ("TRADES",    self.trades_var,     "Header.TLabel"),
-            ("WIN RATE",  self.winrate_var,    "Header.TLabel"),
-        ]:
-            card = tk.Frame(stats_frame, bg="#161b22",
-                            highlightbackground="#30363d", highlightthickness=1)
-            card.pack(side="left", padx=4, ipadx=12, ipady=6, fill="y")
-            label = ttk.Label(card, text=label_text, foreground="#8b949e", background="#161b22",
-                              font=("Consolas", 8))
-            label.pack(anchor="w")
-            value = ttk.Label(card, textvariable=var, style=sty, background="#161b22")
+        self.cash_var = tk.StringVar(value="$0.00")
+        self.pnl_var = tk.StringVar(value="+0.00%")
+        self.trades_var = tk.StringVar(value="0")
+        self.winrate_var = tk.StringVar(value="0.0%")
+        self.open_var = tk.StringVar(value="0")
+        metrics = [
+            ("Net equity", self.portfolio_var, "Estimated equity after modeled close costs. Not an exchange-exact liquidation balance."),
+            ("Free cash", self.cash_var, "Available paper cash. Shared cross-margin backing does not guarantee protection from liquidation."),
+            ("Total return", self.pnl_var, "Net equity performance versus total paper deposits, including open losses."),
+            ("Open trades", self.open_var, "Currently open paper positions."),
+            ("Closed trades", self.trades_var, "Closed trades in the current paper session."),
+            ("Win rate", self.winrate_var, "Closed trades with positive net P&L. Open losing trades are not included."),
+        ]
+        self._metric_values = {}
+        for i, (name, var, help_text) in enumerate(metrics):
+            stats_frame.columnconfigure(i, weight=2 if i == 0 else 1, uniform="metrics")
+            group = tk.Frame(stats_frame, bg=BG)
+            group.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 18, 12))
+            label = ttk.Label(group, text=name, foreground=MUTED, font=(FONT, 9))
+            label.pack(anchor="w", pady=(0, 5))
+            value = ttk.Label(group, textvariable=var, font=(FONT, 23 if i == 0 else 17, "bold"))
             value.pack(anchor="w")
-            help_text = stats_help.get(label_text, "")
-            self._tip(card, help_text)
-            self._tip(label, help_text)
-            self._tip(value, help_text)
+            self._metric_values[name] = value
+            for widget in (group, label, value):
+                self._tip(widget, help_text)
 
         self.profit_breakdown_var = tk.StringVar(value="")
         profit_line = ttk.Label(self.root, textvariable=self.profit_breakdown_var,
-                               foreground="#c9d1d9", font=("Consolas", 9), padding=(19, 4))
+                               foreground=MUTED, font=(FONT, 9), padding=(24, 0, 24, 14))
         profit_line.pack(fill="x")
-        profit_line.bind("<Configure>", lambda event: profit_line.configure(wraplength=max(100, event.width - 38)))
-        self._tip(profit_line, "Realized is the net result of closed trades in this session. Open net P&L includes modeled entry/exit fees and accrued funding. Estimates use cached market prices; a high closed-trade win rate can still coexist with large open losses.")
+        profit_line.bind("<Configure>", lambda e: profit_line.configure(wraplength=max(100, e.width - 48)))
+        self._tip(profit_line, "Realized net results and estimated open P&L are separate. A high win rate can coexist with open losses. Cached marks are not guaranteed executable prices.")
 
-        # ── Notebook ──
         nb = ttk.Notebook(self.root)
         self.notebook = nb
-        nb.pack(fill="both", expand=True, padx=0, pady=0)
-
-        open_tab     = tk.Frame(nb, bg="#0d1117")
-        risk_tab     = tk.Frame(nb, bg="#0d1117")
-        charts_tab   = tk.Frame(nb, bg="#0d1117")
-        history_tab  = tk.Frame(nb, bg="#0d1117")
-        ledger_tab   = tk.Frame(nb, bg="#0d1117")
-        settings_tab = tk.Frame(nb, bg="#0d1117")
-        self.settings_tab = settings_tab
-        nb.add(open_tab,     text="  Open  ")
-        nb.add(risk_tab,     text="  Risk  ")
-        nb.add(charts_tab,   text="  Charts  ")
-        nb.add(history_tab,  text="  History  ")
-        nb.add(ledger_tab,   text="  Ledger  ")
-        nb.add(settings_tab, text="  Settings  ")
+        nb.pack(fill="both", expand=True)
+        tabs = [tk.Frame(nb, bg=BG) for _ in range(6)]
+        self.settings_tab = tabs[-1]
+        for tab, name, builder in zip(tabs,
+            ("Open", "Risk", "Charts", "History", "Ledger", "Settings"),
+            (self._build_open_tab, self._build_risk_tab, self._build_charts_tab,
+             self._build_history_tab, self._build_ledger_tab, self._build_settings_tab)):
+            nb.add(tab, text=name)
+            builder(tab)
+        self._polish_controls(nb)
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        self._build_open_tab(open_tab)
-        self._build_risk_tab(risk_tab)
-        self._build_charts_tab(charts_tab)
-        self._build_history_tab(history_tab)
-        self._build_ledger_tab(ledger_tab)
-        self._build_settings_tab(settings_tab)
         if not self._settings_confirmed:
-            nb.select(settings_tab)
-            self.status_var.set("First run: review Settings and click Apply Settings before trading.")
+            nb.select(self.settings_tab)
 
-        # ── Bottom bar ──
-        basket_frame = tk.Frame(self.root, bg="#161b22", padx=15, pady=5)
-        basket_frame.pack(fill="x", side="bottom")
-        self.basket_var = tk.StringVar(value="Basket: loading...")
-        ttk.Label(basket_frame, textvariable=self.basket_var, foreground="#8b949e",
-                  background="#161b22", font=("Consolas", 9)).pack(side="left", anchor="w")
-        ttk.Label(basket_frame, text="FutolTech  |  Futol Ethical Technology Ecosystems",
-                  foreground="#388bfd", background="#161b22",
-                  font=("Consolas", 8, "bold")).pack(side="right", anchor="e")
+        footer = tk.Frame(self.root, bg=BG, padx=24, pady=10)
+        footer.pack(fill="x", side="bottom")
+        self.basket_var = tk.StringVar(value="Basket: waiting")
+        basket_label = ttk.Label(footer, textvariable=self.basket_var,
+                                foreground=MUTED, font=(FONT, 8))
+        basket_label.pack(side="left", fill="x", expand=True)
+        basket_label.bind("<Configure>", lambda e: basket_label.configure(wraplength=max(100, e.width)))
+        ttk.Label(footer, text="FutolTech", foreground=MUTED,
+                  font=(FONT, 8)).pack(side="right", padx=(16, 0))
+
+    def _polish_controls(self, parent):
+        icons = {"Refresh": "refresh", "Export Report": "download", "Export CSV": "download",
+                 "Export Ops Report": "download", "Reset Futures Paper": "reset",
+                 "Apply Settings": "save", "Apply Risk": "save"}
+        for widget in parent.winfo_children():
+            if isinstance(widget, ttk.Button):
+                text = widget.cget("text")
+                if text in icons:
+                    widget.configure(image=self._icons[icons[text]], compound="left")
+                if text in {"Apply Settings", "Apply Risk"}:
+                    widget.configure(style="Primary.TButton")
+                elif text in {"Reset Futures Paper", "Kill Switch"}:
+                    widget.configure(style="Danger.TButton")
+            self._polish_controls(widget)
 
     def _start_telegram_dashboard(self):
         self._telegram_commands = tg.TelegramDashboardPoller(
@@ -505,58 +464,82 @@ class Dashboard:
 
 
     def _build_open_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=3, uniform="trade_sections")
+        parent.rowconfigure(1, weight=2, uniform="trade_sections")
+        open_section = tk.Frame(parent, bg=BG)
+        open_section.grid(row=0, column=0, sticky="nsew")
+        closed_section = tk.Frame(parent, bg=BG)
+        closed_section.grid(row=1, column=0, sticky="nsew")
         # Open positions
-        pl = tk.Frame(parent, bg="#0d1117")
+        pl = tk.Frame(open_section, bg="#111214")
         pl.pack(fill="x", padx=15, pady=(10, 2))
-        ttk.Label(pl, text="OPEN POSITIONS", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(pl, text="Open positions", style="Header.TLabel").pack(side="left")
+        self._positions_count = tk.StringVar(value=f"0 / {config.MAX_OPEN_TRADES}")
+        ttk.Label(pl, textvariable=self._positions_count, foreground=MUTED).pack(side="right")
 
-        pf = tk.Frame(parent, bg="#0d1117")
+        pf = tk.Frame(open_section, bg="#111214")
         pf.pack(fill="both", expand=True, padx=15)
 
         pos_cols = ("symbol","amount","lev","entry","current","pnl","trigger","tp","sl","age")
         self.pos_tree = ttk.Treeview(pf, columns=pos_cols, show="headings", height=5)
-        pnl_heading = "NET P&L % / PRICE"
-        risk_heading = "CROSS LIQ"
+        pnl_heading = "Net P&L / Price move"
+        risk_heading = "Cross liq. est."
         for col, heading, width in [
-            ("symbol","SYMBOL",70),("amount","AMOUNT $",85),("lev","ENTRY LEV",70),
-            ("entry","ENTRY",90),("current","CURRENT",90),
-            ("pnl",pnl_heading,160),("trigger","24H TRIGGER",90),
-            ("tp","TP",90),("sl",risk_heading,105),("age","AGE",55),
+            ("symbol","Symbol",75),("amount","Margin $",98),("lev","Entry lev.",86),
+            ("entry","Entry",94),("current","Mark",94),
+            ("pnl",pnl_heading,178),("trigger","24h trigger",96),
+            ("tp","Net TP",94),("sl",risk_heading,108),("age","Age",64),
         ]:
             self.pos_tree.heading(col, text=heading)
-            self.pos_tree.column(col, width=width, anchor="center")
-        self.pos_tree.pack(fill="both", expand=True)
+            self.pos_tree.column(col, width=width, minwidth=width, anchor="center")
+        self._mount_trade_table(self.pos_tree, pf)
+        self._open_empty = ttk.Label(pf, text="No open positions", foreground=MUTED,
+                                     background="#191c1f", padding=10)
 
         # Closed trades
-        cl = tk.Frame(parent, bg="#0d1117")
+        cl = tk.Frame(closed_section, bg="#111214")
         cl.pack(fill="x", padx=15, pady=(10, 2))
-        ttk.Label(cl, text="RECENT CLOSED TRADES", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(cl, text="Recent closed trades", style="Header.TLabel").pack(anchor="w")
 
-        cf = tk.Frame(parent, bg="#0d1117")
+        cf = tk.Frame(closed_section, bg="#111214")
         cf.pack(fill="both", expand=True, padx=15, pady=(0, 8))
 
         closed_cols = ("symbol","amount","lev","entry","exit","pnl","pnl_usd","trigger","reason","time")
         self.closed_tree = ttk.Treeview(cf, columns=closed_cols, show="headings", height=5)
         for col, heading, width in [
-            ("symbol","SYMBOL",65),("amount","AMOUNT $",80),("lev","ENTRY LEV",70),
-            ("entry","ENTRY",85),("exit","EXIT",85),
-            ("pnl","P&L %",65),("pnl_usd","P&L $",75),
-            ("trigger","24H TRIGGER",90),("reason","REASON",75),("time","CLOSED",95),
+            ("symbol","Symbol",75),("amount","Margin $",98),("lev","Entry lev.",86),
+            ("entry","Entry",94),("exit","Exit",94),
+            ("pnl","Net P&L %",94),("pnl_usd","Net P&L $",94),
+            ("trigger","24h trigger",96),("reason","Reason",112),("time","Closed",108),
         ]:
             self.closed_tree.heading(col, text=heading)
-            self.closed_tree.column(col, width=width, anchor="center")
-        self.closed_tree.pack(fill="both", expand=True)
+            self.closed_tree.column(col, width=width, minwidth=width, anchor="center")
+        self._mount_trade_table(self.closed_tree, cf)
+
+    @staticmethod
+    def _mount_trade_table(tree, parent):
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        vertical = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        horizontal = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        tree.tag_configure("even", background="#191c1f")
+        tree.tag_configure("odd", background="#1d2023")
 
     # ── Professional risk cockpit ─────────────────────────────────────────────
 
     def _build_risk_tab(self, parent):
-        body = tk.Frame(parent, bg="#0d1117", padx=15, pady=12)
+        body = tk.Frame(parent, bg="#111214", padx=15, pady=12)
         body.pack(fill="both", expand=True)
 
-        top = tk.Frame(body, bg="#0d1117")
+        top = tk.Frame(body, bg="#111214")
         top.pack(fill="x", pady=(0, 8))
-        ttk.Label(top, text="PROFESSIONAL CONTROL CENTER", style="Header.TLabel",
-                  background="#0d1117").pack(side="left")
+        ttk.Label(top, text="Risk controls", style="Header.TLabel",
+                  background="#111214").pack(side="left")
         risk_refresh_btn = ttk.Button(top, text="Refresh", style="Btn.TButton",
                                       command=self._refresh_risk_tab)
         risk_refresh_btn.pack(side="right")
@@ -572,10 +555,10 @@ class Dashboard:
 
         self._risk_summary_var = tk.StringVar(value="")
         ttk.Label(body, textvariable=self._risk_summary_var,
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 9)).pack(fill="x", anchor="w", pady=(0, 8))
+                  foreground="#a0aab2", background="#111214",
+                  font=(FONT, 9)).pack(fill="x", anchor="w", pady=(0, 8))
 
-        controls = tk.Frame(body, bg="#0d1117")
+        controls = tk.Frame(body, bg="#111214")
         controls.pack(fill="x", pady=(0, 10))
 
         self._risk_profile = tk.StringVar(value=config.BOT_PROFILE)
@@ -588,17 +571,17 @@ class Dashboard:
                 parent_frame,
                 textvariable=var,
                 width=width,
-                font=("Consolas", 9),
-                bg="#f0f6fc",
-                fg="#0d1117",
-                insertbackground="#0d1117",
-                selectbackground="#58a6ff",
-                selectforeground="#0d1117",
-                relief="solid",
-                bd=1,
+                font=(FONT, 9),
+                bg="#f5f7f8",
+                fg="#111214",
+                insertbackground="#111214",
+                selectbackground="#59dcb2",
+                selectforeground="#111214",
+                relief="flat",
+                bd=0,
                 highlightthickness=1,
-                highlightbackground="#8b949e",
-                highlightcolor="#58a6ff",
+                highlightbackground="#343b40",
+                highlightcolor="#59dcb2",
             )
 
         for label_text, var, width in [
@@ -607,10 +590,10 @@ class Dashboard:
             ("Max open notional $", self._risk_max_exposure, 9),
             ("Max loss streak", self._risk_max_loss_streak, 5),
         ]:
-            group = tk.Frame(controls, bg="#0d1117")
+            group = tk.Frame(controls, bg="#111214")
             group.pack(side="left", padx=(0, 10))
-            label = ttk.Label(group, text=label_text, foreground="#8b949e", background="#0d1117",
-                              font=("Consolas", 8))
+            label = ttk.Label(group, text=label_text, foreground="#a0aab2", background="#111214",
+                              font=(FONT, 8))
             label.pack(anchor="w")
             input_widget = entry(group, var, width)
             input_widget.pack(anchor="w")
@@ -618,7 +601,7 @@ class Dashboard:
             self._tip(label, help_text)
             self._tip(input_widget, help_text)
 
-        btns = tk.Frame(body, bg="#0d1117")
+        btns = tk.Frame(body, bg="#111214")
         btns.pack(fill="x", pady=(0, 10))
         apply_risk_btn = ttk.Button(btns, text="Apply Risk", style="Btn.TButton",
                                     command=self._apply_risk_settings)
@@ -638,19 +621,19 @@ class Dashboard:
         self._tip(resume_allowed_btn, "Resume futures scanning only if all configured risk guards pass.")
         self._risk_action_var = tk.StringVar(value="")
         ttk.Label(btns, textvariable=self._risk_action_var,
-                  foreground="#3fb950", background="#0d1117",
-                  font=("Consolas", 9)).pack(side="left", padx=10)
+                  foreground="#47c997", background="#111214",
+                  font=(FONT, 9)).pack(side="left", padx=10)
 
-        panes = tk.PanedWindow(body, orient=tk.VERTICAL, sashwidth=4, bg="#0d1117")
+        panes = tk.PanedWindow(body, orient=tk.VERTICAL, sashwidth=4, bg="#111214")
         self._risk_panes = panes
         panes.pack(fill="both", expand=True)
 
-        risk_frame = tk.Frame(panes, bg="#0d1117")
+        risk_frame = tk.Frame(panes, bg="#111214")
         panes.add(risk_frame, minsize=155)
-        ttk.Label(risk_frame, text="RISK, PROFILE, AND FORWARD TEST", style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(0, 3))
+        ttk.Label(risk_frame, text="Account risk", style="Header.TLabel",
+                  background="#111214").pack(anchor="w", pady=(0, 3))
         cols = ("metric", "value", "limit", "status")
-        risk_table = tk.Frame(risk_frame, bg="#0d1117")
+        risk_table = tk.Frame(risk_frame, bg="#111214")
         risk_table.pack(fill="both", expand=True)
         self.risk_tree = ttk.Treeview(risk_table, columns=cols, show="headings", height=7)
         for col, heading, width in [
@@ -661,20 +644,20 @@ class Dashboard:
         ]:
             self.risk_tree.heading(col, text=heading)
             self.risk_tree.column(col, width=width, anchor="center")
-        self.risk_tree.tag_configure("ok", foreground="#3fb950")
-        self.risk_tree.tag_configure("warn", foreground="#e3b341")
-        self.risk_tree.tag_configure("block", foreground="#f85149")
+        self.risk_tree.tag_configure("ok", foreground="#47c997")
+        self.risk_tree.tag_configure("warn", foreground="#e9bc67")
+        self.risk_tree.tag_configure("block", foreground="#ff777d")
         risk_vsb = ttk.Scrollbar(risk_table, orient="vertical", command=self.risk_tree.yview)
         self.risk_tree.configure(yscrollcommand=risk_vsb.set)
         self.risk_tree.pack(side="left", fill="both", expand=True)
         risk_vsb.pack(side="right", fill="y")
 
-        decision_frame = tk.Frame(panes, bg="#0d1117")
+        decision_frame = tk.Frame(panes, bg="#111214")
         panes.add(decision_frame, minsize=115)
-        ttk.Label(decision_frame, text="STRATEGY CONFIDENCE / DECISION LOG", style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(8, 3))
+        ttk.Label(decision_frame, text="Entry decisions", style="Header.TLabel",
+                  background="#111214").pack(anchor="w", pady=(8, 3))
         dcols = ("time", "domain", "action", "decision", "score", "reason")
-        decision_table = tk.Frame(decision_frame, bg="#0d1117")
+        decision_table = tk.Frame(decision_frame, bg="#111214")
         decision_table.pack(fill="both", expand=True)
         self.decision_tree = ttk.Treeview(decision_table, columns=dcols, show="headings", height=5)
         for col, heading, width in [
@@ -687,9 +670,9 @@ class Dashboard:
         ]:
             self.decision_tree.heading(col, text=heading)
             self.decision_tree.column(col, width=width, anchor="center")
-        self.decision_tree.tag_configure("go", foreground="#3fb950")
-        self.decision_tree.tag_configure("wait", foreground="#e3b341")
-        self.decision_tree.tag_configure("block", foreground="#f85149")
+        self.decision_tree.tag_configure("go", foreground="#47c997")
+        self.decision_tree.tag_configure("wait", foreground="#e9bc67")
+        self.decision_tree.tag_configure("block", foreground="#ff777d")
         decision_vsb = ttk.Scrollbar(decision_table, orient="vertical", command=self.decision_tree.yview)
         self.decision_tree.configure(yscrollcommand=decision_vsb.set)
         self.decision_tree.pack(side="left", fill="both", expand=True)
@@ -698,23 +681,23 @@ class Dashboard:
         self.root.after(150, self._fit_risk_panes)
 
     def _build_charts_tab(self, parent):
-        ctrl = tk.Frame(parent, bg="#0d1117", pady=8)
+        ctrl = tk.Frame(parent, bg="#111214", pady=8)
         ctrl.pack(fill="x", padx=15)
         ttk.Button(ctrl, text="Refresh Charts", style="Btn.TButton",
                    command=self._draw_charts).pack(side="left")
         ttk.Label(ctrl, text="  Updates automatically when you switch to this tab.",
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 9)).pack(side="left")
+                  foreground="#a0aab2", background="#111214",
+                  font=(FONT, 9)).pack(side="left")
 
-        self._chart_frame = tk.Frame(parent, bg="#0d1117")
+        self._chart_frame = tk.Frame(parent, bg="#111214")
         self._chart_frame.pack(fill="both", expand=True)
         self._canvas_widget = None
 
         # Placeholder until first draw
         ttk.Label(self._chart_frame,
                   text="Switch to Charts tab after the bot runs a few trades.",
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 10)).pack(expand=True)
+                  foreground="#a0aab2", background="#111214",
+                  font=(FONT, 10)).pack(expand=True)
 
     # ── Chart rendering ────────────────────────────────────────────────────────
 
@@ -728,55 +711,55 @@ class Dashboard:
             eq_hist = list(self._equity_history)
 
         plt.style.use("dark_background")
-        fig = plt.figure(figsize=(11, 7), facecolor="#0d1117")
+        fig = plt.figure(figsize=(11, 7), facecolor="#111214")
         gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.5, wspace=0.4)
 
         # ── 1. Equity curve ──
         ax1 = fig.add_subplot(gs[0, :])
-        ax1.set_facecolor("#161b22")
+        ax1.set_facecolor("#191c1f")
         if len(eq_hist) >= 2:
             xs = [e[0] for e in eq_hist]
             ys = [e[1] for e in eq_hist]
-            ax1.plot(xs, ys, color="#58a6ff", linewidth=2)
+            ax1.plot(xs, ys, color="#59dcb2", linewidth=2)
             ax1.fill_between(xs, config.CAPITAL_USD, ys,
                              where=[v >= config.CAPITAL_USD for v in ys],
-                             alpha=0.15, color="#3fb950")
+                             alpha=0.15, color="#47c997")
             ax1.fill_between(xs, config.CAPITAL_USD, ys,
                              where=[v < config.CAPITAL_USD for v in ys],
-                             alpha=0.15, color="#f85149")
-            ax1.axhline(config.CAPITAL_USD, color="#8b949e",
+                             alpha=0.15, color="#ff777d")
+            ax1.axhline(config.CAPITAL_USD, color="#a0aab2",
                         linestyle="--", linewidth=0.8, alpha=0.6)
             final  = ys[-1]
             change = (final - config.CAPITAL_USD) / config.CAPITAL_USD * 100
             ax1.set_title(f"Equity Curve  |  ${config.CAPITAL_USD:.0f} -> ${final:.2f} ({change:+.2f}%)",
-                          color="#c9d1d9", fontsize=10)
+                          color="#edf1f4", fontsize=10)
         else:
-            ax1.set_title("Equity Curve  (collecting data...)", color="#c9d1d9", fontsize=10)
+            ax1.set_title("Equity Curve  (collecting data...)", color="#edf1f4", fontsize=10)
             ax1.text(0.5, 0.5, "Not enough data yet", transform=ax1.transAxes,
-                     ha="center", va="center", color="#8b949e", fontsize=11)
-        ax1.tick_params(colors="#8b949e", labelsize=7)
-        ax1.set_ylabel("Portfolio $", color="#8b949e", fontsize=8)
-        for sp in ax1.spines.values(): sp.set_edgecolor("#30363d")
+                     ha="center", va="center", color="#a0aab2", fontsize=11)
+        ax1.tick_params(colors="#a0aab2", labelsize=7)
+        ax1.set_ylabel("Portfolio $", color="#a0aab2", fontsize=8)
+        for sp in ax1.spines.values(): sp.set_edgecolor("#343b40")
 
         # ── 2. P&L distribution ──
         ax2 = fig.add_subplot(gs[1, 0])
-        ax2.set_facecolor("#161b22")
+        ax2.set_facecolor("#191c1f")
         if closed:
             pnls = [t.pnl_pct for t in closed]
-            ax2.hist(pnls, bins=max(10, len(pnls)//3), color="#58a6ff",
-                     alpha=0.75, edgecolor="#0d1117", linewidth=0.3)
-            ax2.axvline(0, color="#f85149", linewidth=1.2, linestyle="--")
-            ax2.axvline(np.mean(pnls), color="#3fb950", linewidth=1.2, linestyle="--",
+            ax2.hist(pnls, bins=max(10, len(pnls)//3), color="#59dcb2",
+                     alpha=0.75, edgecolor="#111214", linewidth=0.3)
+            ax2.axvline(0, color="#ff777d", linewidth=1.2, linestyle="--")
+            ax2.axvline(np.mean(pnls), color="#47c997", linewidth=1.2, linestyle="--",
                         label=f"Mean {np.mean(pnls):+.2f}%")
-            ax2.legend(fontsize=7, labelcolor="#c9d1d9", facecolor="#21262d")
-        ax2.set_title("Trade Returns", color="#c9d1d9", fontsize=9)
-        ax2.set_xlabel("P&L %", color="#8b949e", fontsize=8)
-        ax2.tick_params(colors="#8b949e", labelsize=7)
-        for sp in ax2.spines.values(): sp.set_edgecolor("#30363d")
+            ax2.legend(fontsize=7, labelcolor="#edf1f4", facecolor="#24282c")
+        ax2.set_title("Trade Returns", color="#edf1f4", fontsize=9)
+        ax2.set_xlabel("P&L %", color="#a0aab2", fontsize=8)
+        ax2.tick_params(colors="#a0aab2", labelsize=7)
+        for sp in ax2.spines.values(): sp.set_edgecolor("#343b40")
 
         # ── 3. Exit breakdown pie ──
         ax3 = fig.add_subplot(gs[1, 1])
-        ax3.set_facecolor("#161b22")
+        ax3.set_facecolor("#191c1f")
         if closed:
             reasons = defaultdict(int)
             for t in closed:
@@ -784,39 +767,39 @@ class Dashboard:
                 reasons[r] += 1
             labels = list(reasons.keys())
             sizes  = list(reasons.values())
-            colors = {"tp_hit":"#3fb950","sl_hit":"#f85149","crash_sl":"#f0883e",
-                      "expired":"#e3b341","liquidated":"#ff6b6b",
-                      "month_end":"#8b949e"}
-            clrs = [colors.get(l, "#58a6ff") for l in labels]
+            colors = {"tp_hit":"#47c997","sl_hit":"#ff777d","crash_sl":"#f0883e",
+                      "expired":"#e9bc67","liquidated":"#ff6b6b",
+                      "month_end":"#a0aab2"}
+            clrs = [colors.get(l, "#59dcb2") for l in labels]
             wedges, texts, autotexts = ax3.pie(
                 sizes, labels=labels, autopct="%1.0f%%",
                 colors=clrs, startangle=90,
-                textprops={"color":"#c9d1d9","fontsize":7},
+                textprops={"color":"#edf1f4","fontsize":7},
             )
             for at in autotexts:
-                at.set_color("#0d1117"); at.set_fontsize(7); at.set_fontweight("bold")
+                at.set_color("#111214"); at.set_fontsize(7); at.set_fontweight("bold")
         else:
             ax3.text(0.5, 0.5, "No trades yet", transform=ax3.transAxes,
-                     ha="center", va="center", color="#8b949e")
-        ax3.set_title("Exit Breakdown", color="#c9d1d9", fontsize=9)
+                     ha="center", va="center", color="#a0aab2")
+        ax3.set_title("Exit Breakdown", color="#edf1f4", fontsize=9)
 
         # ── 4. Cumulative P&L per trade ──
         ax4 = fig.add_subplot(gs[1, 2])
-        ax4.set_facecolor("#161b22")
+        ax4.set_facecolor("#191c1f")
         if closed:
             cum = np.cumsum([t.pnl_usd for t in closed])
-            colors_bar = ["#3fb950" if v >= 0 else "#f85149" for v in cum]
+            colors_bar = ["#47c997" if v >= 0 else "#ff777d" for v in cum]
             ax4.bar(range(len(cum)), cum, color=colors_bar, alpha=0.8, width=0.8)
-            ax4.axhline(0, color="#8b949e", linewidth=0.8)
-            ax4.set_title(f"Cumulative P&L  ({cum[-1]:+.2f} USD)", color="#c9d1d9", fontsize=9)
-            ax4.set_xlabel("Trade #", color="#8b949e", fontsize=8)
-            ax4.set_ylabel("USD", color="#8b949e", fontsize=8)
+            ax4.axhline(0, color="#a0aab2", linewidth=0.8)
+            ax4.set_title(f"Cumulative P&L  ({cum[-1]:+.2f} USD)", color="#edf1f4", fontsize=9)
+            ax4.set_xlabel("Trade #", color="#a0aab2", fontsize=8)
+            ax4.set_ylabel("USD", color="#a0aab2", fontsize=8)
         else:
-            ax4.set_title("Cumulative P&L", color="#c9d1d9", fontsize=9)
+            ax4.set_title("Cumulative P&L", color="#edf1f4", fontsize=9)
             ax4.text(0.5, 0.5, "No trades yet", transform=ax4.transAxes,
-                     ha="center", va="center", color="#8b949e")
-        ax4.tick_params(colors="#8b949e", labelsize=7)
-        for sp in ax4.spines.values(): sp.set_edgecolor("#30363d")
+                     ha="center", va="center", color="#a0aab2")
+        ax4.tick_params(colors="#a0aab2", labelsize=7)
+        for sp in ax4.spines.values(): sp.set_edgecolor("#343b40")
 
         # Footer stats
         if closed:
@@ -828,9 +811,9 @@ class Dashboard:
                 f"Avg P&L: {ev:+.3f}%  |  "
                 f"Best: {max(t.pnl_pct for t in closed):+.2f}%  |  "
                 f"Worst: {min(t.pnl_pct for t in closed):+.2f}%",
-                color="#8b949e", fontsize=7.5)
+                color="#a0aab2", fontsize=7.5)
 
-        fig.patch.set_facecolor("#0d1117")
+        fig.patch.set_facecolor("#111214")
 
         canvas = FigureCanvasTkAgg(fig, master=self._chart_frame)
         canvas.draw()
@@ -841,7 +824,7 @@ class Dashboard:
     # ── History tab ───────────────────────────────────────────────────────────
 
     def _build_history_tab(self, parent):
-        ctrl = tk.Frame(parent, bg="#0d1117", pady=8)
+        ctrl = tk.Frame(parent, bg="#111214", pady=8)
         ctrl.pack(fill="x", padx=15)
         ttk.Button(ctrl, text="Refresh", style="Btn.TButton",
                    command=self._refresh_history).pack(side="left")
@@ -850,19 +833,19 @@ class Dashboard:
         ttk.Button(ctrl, text="Reset Futures Paper", style="Btn.TButton",
                    command=self._reset_futures_paper).pack(side="left", padx=(6, 0))
         self._hist_summary_var = tk.StringVar(value="")
-        summary_label = ttk.Label(parent, textvariable=self._hist_summary_var, foreground="#8b949e",
-                                  background="#0d1117", font=("Consolas", 9), wraplength=950)
+        summary_label = ttk.Label(parent, textvariable=self._hist_summary_var, foreground="#a0aab2",
+                                  background="#111214", font=(FONT, 9), wraplength=950)
         summary_label.pack(fill="x", padx=15, pady=(0, 4))
         summary_label.bind("<Configure>", lambda e: summary_label.configure(wraplength=max(250, e.width)))
         self._hist_metrics_var = tk.StringVar(value="")
         metrics_label = ttk.Label(parent, textvariable=self._hist_metrics_var,
-                                  foreground="#f0f6fc", background="#0d1117",
-                                  font=("Consolas", 10), wraplength=950)
+                                  foreground="#f5f7f8", background="#111214",
+                                  font=(FONT, 10), wraplength=950)
         metrics_label.pack(fill="x", padx=15, pady=(0, 8))
         metrics_label.bind("<Configure>", lambda e: metrics_label.configure(wraplength=max(250, e.width)))
         self._tip(metrics_label, "Closed-trade net results including modeled fees and funding. Profit factor is total winning dollars divided by total losing dollars; above 1 is positive realized performance. Expectancy is average net dollars per closed trade. Open losses are not included.")
 
-        hf = tk.Frame(parent, bg="#0d1117")
+        hf = tk.Frame(parent, bg="#111214")
         hf.pack(fill="both", expand=True, padx=15, pady=(0, 8))
 
         hist_cols = ("date","symbol","engine","entry","exit","amount","lev","pnl_pct","pnl_usd","reason","trigger")
@@ -881,8 +864,8 @@ class Dashboard:
         self.hist_tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        self.hist_tree.tag_configure("win",  foreground="#3fb950")
-        self.hist_tree.tag_configure("loss", foreground="#f85149")
+        self.hist_tree.tag_configure("win",  foreground="#47c997")
+        self.hist_tree.tag_configure("loss", foreground="#ff777d")
 
     def _futures_history_session_note(self) -> str:
         sessions = recent_reset_sessions(limit=1)
@@ -1070,20 +1053,20 @@ class Dashboard:
     # ── Event ledger tab ─────────────────────────────────────────────────────
 
     def _build_ledger_tab(self, parent):
-        body = tk.Frame(parent, bg="#0d1117", padx=15, pady=12)
+        body = tk.Frame(parent, bg="#111214", padx=15, pady=12)
         body.pack(fill="both", expand=True)
 
-        top = tk.Frame(body, bg="#0d1117")
+        top = tk.Frame(body, bg="#111214")
         top.pack(fill="x", pady=(0, 8))
         ttk.Label(top, text="UNIFIED EVENT LEDGER", style="Header.TLabel",
-                  background="#0d1117").pack(side="left")
+                  background="#111214").pack(side="left")
         ttk.Button(top, text="Refresh", style="Btn.TButton",
                    command=self._refresh_event_ledger).pack(side="right")
 
         self._ledger_summary_var = tk.StringVar(value="")
         ttk.Label(body, textvariable=self._ledger_summary_var,
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 9)).pack(fill="x", anchor="w", pady=(0, 8))
+                  foreground="#a0aab2", background="#111214",
+                  font=(FONT, 9)).pack(fill="x", anchor="w", pady=(0, 8))
 
         cols = ("time", "domain", "type", "status", "amount", "pnl", "balance", "symbol", "details")
         self.ledger_tree = ttk.Treeview(body, columns=cols, show="headings", height=22)
@@ -1100,9 +1083,9 @@ class Dashboard:
         ]:
             self.ledger_tree.heading(col, text=heading)
             self.ledger_tree.column(col, width=width, anchor="center")
-        self.ledger_tree.tag_configure("profit", foreground="#3fb950")
-        self.ledger_tree.tag_configure("loss", foreground="#f85149")
-        self.ledger_tree.tag_configure("system", foreground="#e3b341")
+        self.ledger_tree.tag_configure("profit", foreground="#47c997")
+        self.ledger_tree.tag_configure("loss", foreground="#ff777d")
+        self.ledger_tree.tag_configure("system", foreground="#e9bc67")
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.ledger_tree.yview)
         self.ledger_tree.configure(yscrollcommand=vsb.set)
         self.ledger_tree.pack(side="left", fill="both", expand=True)
@@ -1123,27 +1106,34 @@ class Dashboard:
         text = str(value or "")
         return text if len(text) <= limit else text[: max(0, limit - 3)] + "..."
 
+    @staticmethod
+    def _price_text(value) -> str:
+        if value is None or not math.isfinite(value):
+            return "--"
+        decimals = 8 if 0 < abs(value) < 0.01 else 4
+        return f"${value:,.{decimals}f}"
+
     # ── Settings tab ──────────────────────────────────────────────────────────
 
     def _build_settings_tab(self, parent):
-        canvas = tk.Canvas(parent, bg="#0d1117", highlightthickness=0)
+        canvas = tk.Canvas(parent, bg="#111214", highlightthickness=0)
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         canvas.configure(yscrollcommand=scrollbar.set)
-        body = tk.Frame(canvas, bg="#0d1117", padx=15, pady=14)
+        body = tk.Frame(canvas, bg="#111214", padx=15, pady=14)
         body_window = canvas.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_window, width=e.width))
         canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
-        settings_panel = tk.Frame(body, bg="#0d1117")
+        settings_panel = tk.Frame(body, bg="#111214")
         settings_panel.pack(side="left", fill="y", anchor="nw")
 
-        ttk.Label(settings_panel, text="TRADING PARAMETERS", style="Header.TLabel",
-                  background="#0d1117").pack(anchor="w", pady=(0, 4))
+        ttk.Label(settings_panel, text="Trading parameters", style="Header.TLabel",
+                  background="#111214").pack(anchor="w", pady=(0, 4))
 
-        grid = tk.Frame(settings_panel, bg="#0d1117")
+        grid = tk.Frame(settings_panel, bg="#111214")
         grid.pack(fill="x")
 
         def field(parent, var, width):
@@ -1151,25 +1141,25 @@ class Dashboard:
                 parent,
                 textvariable=var,
                 width=width,
-                font=("Consolas", 10),
-                bg="#f0f6fc",
-                fg="#0d1117",
-                insertbackground="#0d1117",
-                selectbackground="#58a6ff",
-                selectforeground="#0d1117",
-                relief="solid",
-                bd=1,
+                font=(FONT, 10),
+                bg="#f5f7f8",
+                fg="#111214",
+                insertbackground="#111214",
+                selectbackground="#59dcb2",
+                selectforeground="#111214",
+                relief="flat",
+                bd=0,
                 highlightthickness=1,
-                highlightbackground="#8b949e",
-                highlightcolor="#58a6ff",
+                highlightbackground="#343b40",
+                highlightcolor="#59dcb2",
             )
 
         def row(label, widget_factory, r):
-            label_widget = ttk.Label(grid, text=label, foreground="#8b949e", background="#0d1117",
-                                     font=("Consolas", 9), width=22)
+            label_widget = ttk.Label(grid, text=label, foreground="#a0aab2", background="#111214",
+                                     font=(FONT, 9), width=22)
             label_widget.grid(row=r, column=0, sticky="w", pady=4)
             w = widget_factory(grid)
-            w.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+            w.grid(row=r, column=1, sticky="w", padx=8, pady=6, ipady=4)
             help_text = SETTINGS_HELP.get(label, "")
             self._tip(label_widget, help_text)
             self._tip(w, help_text)
@@ -1181,10 +1171,10 @@ class Dashboard:
 
         # Leverage
         self._s_leverage = tk.IntVar(value=config.LEVERAGE)
-        lev_frame = tk.Frame(grid, bg="#0d1117")
+        lev_frame = tk.Frame(grid, bg="#111214")
         lev_frame.grid(row=1, column=1, sticky="w", padx=8, pady=4)
-        lev_label = ttk.Label(grid, text="Leverage", foreground="#8b949e", background="#0d1117",
-                              font=("Consolas", 9), width=22)
+        lev_label = ttk.Label(grid, text="Leverage", foreground="#a0aab2", background="#111214",
+                              font=(FONT, 9), width=22)
         lev_label.grid(row=1, column=0, sticky="w", pady=4)
         lev_spin = tk.Spinbox(
             lev_frame,
@@ -1192,22 +1182,22 @@ class Dashboard:
             to=config.MAX_LEVERAGE,
             textvariable=self._s_leverage,
             width=5,
-            font=("Consolas", 10),
-            bg="#f0f6fc",
-            fg="#0d1117",
-            buttonbackground="#c9d1d9",
-            insertbackground="#0d1117",
-            selectbackground="#58a6ff",
-            selectforeground="#0d1117",
+            font=(FONT, 10),
+            bg="#f5f7f8",
+            fg="#111214",
+            buttonbackground="#edf1f4",
+            insertbackground="#111214",
+            selectbackground="#59dcb2",
+            selectforeground="#111214",
             relief="solid",
             bd=1,
             highlightthickness=1,
-            highlightbackground="#8b949e",
-            highlightcolor="#58a6ff",
+            highlightbackground="#343b40",
+            highlightcolor="#59dcb2",
         )
-        lev_spin.pack(side="left")
-        ttk.Label(lev_frame, text="x", foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 9)).pack(side="left", padx=(6, 0))
+        lev_spin.pack(side="left", ipady=4)
+        ttk.Label(lev_frame, text="x", foreground="#a0aab2", background="#111214",
+                  font=(FONT, 9)).pack(side="left", padx=(6, 0))
         self._tip(lev_label, SETTINGS_HELP["Leverage"])
         self._tip(lev_spin, SETTINGS_HELP["Leverage"])
 
@@ -1218,17 +1208,17 @@ class Dashboard:
         # SL enable + %
         self._s_sl_enabled = tk.BooleanVar(value=config.FUTURES_USE_SL)
         self._s_sl = tk.StringVar(value=str(round(config.FUTURES_NET_SL_PCT * 100, 2)))
-        sl_frame = tk.Frame(grid, bg="#0d1117")
+        sl_frame = tk.Frame(grid, bg="#111214")
         sl_frame.grid(row=3, column=1, sticky="w", padx=8, pady=4)
-        sl_label = ttk.Label(grid, text="Stop Loss", foreground="#8b949e", background="#0d1117",
-                             font=("Consolas", 9), width=22)
+        sl_label = ttk.Label(grid, text="Stop Loss", foreground="#a0aab2", background="#111214",
+                             font=(FONT, 9), width=22)
         sl_label.grid(row=3, column=0, sticky="w", pady=4)
         sl_check = ttk.Checkbutton(sl_frame, text="Enable", variable=self._s_sl_enabled)
         sl_check.pack(side="left")
         sl_input = field(sl_frame, self._s_sl, 8)
-        sl_input.pack(side="left", padx=8)
-        ttk.Label(sl_frame, text="% net", foreground="#8b949e", background="#0d1117",
-                  font=("Consolas",9)).pack(side="left")
+        sl_input.pack(side="left", padx=8, ipady=4)
+        ttk.Label(sl_frame, text="% net", foreground="#a0aab2", background="#111214",
+                  font=(FONT,9)).pack(side="left")
         self._tip(sl_label, SETTINGS_HELP["Stop Loss"])
         self._tip(sl_check, SETTINGS_HELP["Stop Loss"])
         self._tip(sl_input, SETTINGS_HELP["Stop Loss"])
@@ -1236,10 +1226,10 @@ class Dashboard:
         # Crash protection
         self._s_crash_entry_guard = tk.BooleanVar(value=config.CRASH_ENTRY_GUARD_ENABLED)
         self._s_crash_emergency_sl = tk.BooleanVar(value=config.CRASH_EMERGENCY_SL_ENABLED)
-        crash_frame = tk.Frame(grid, bg="#0d1117")
+        crash_frame = tk.Frame(grid, bg="#111214")
         crash_frame.grid(row=4, column=1, sticky="w", padx=8, pady=4)
-        crash_label = ttk.Label(grid, text="Crash protection", foreground="#8b949e", background="#0d1117",
-                                font=("Consolas", 9), width=22)
+        crash_label = ttk.Label(grid, text="Crash protection", foreground="#a0aab2", background="#111214",
+                                font=(FONT, 9), width=22)
         crash_label.grid(row=4, column=0, sticky="w", pady=4)
         crash_entry_check = ttk.Checkbutton(
             crash_frame,
@@ -1276,10 +1266,10 @@ class Dashboard:
 
         # Maximum simultaneous futures trades
         self._s_max_open_trades = tk.IntVar(value=config.MAX_OPEN_TRADES)
-        max_open_frame = tk.Frame(grid, bg="#0d1117")
+        max_open_frame = tk.Frame(grid, bg="#111214")
         max_open_frame.grid(row=8, column=1, sticky="w", padx=8, pady=4)
-        max_open_label = ttk.Label(grid, text="Max open trades", foreground="#8b949e", background="#0d1117",
-                                   font=("Consolas", 9), width=22)
+        max_open_label = ttk.Label(grid, text="Max open trades", foreground="#a0aab2", background="#111214",
+                                   font=(FONT, 9), width=22)
         max_open_label.grid(row=8, column=0, sticky="w", pady=4)
         max_open_spin = tk.Spinbox(
             max_open_frame,
@@ -1287,32 +1277,32 @@ class Dashboard:
             to=config.MAX_OPEN_TRADES_CAP,
             textvariable=self._s_max_open_trades,
             width=5,
-            font=("Consolas", 10),
-            bg="#f0f6fc",
-            fg="#0d1117",
-            buttonbackground="#c9d1d9",
-            insertbackground="#0d1117",
-            selectbackground="#58a6ff",
-            selectforeground="#0d1117",
+            font=(FONT, 10),
+            bg="#f5f7f8",
+            fg="#111214",
+            buttonbackground="#edf1f4",
+            insertbackground="#111214",
+            selectbackground="#59dcb2",
+            selectforeground="#111214",
             relief="solid",
             bd=1,
             highlightthickness=1,
-            highlightbackground="#8b949e",
-            highlightcolor="#58a6ff",
+            highlightbackground="#343b40",
+            highlightcolor="#59dcb2",
         )
-        max_open_spin.pack(side="left")
+        max_open_spin.pack(side="left", ipady=4)
         ttk.Label(max_open_frame, text=f"1-{config.MAX_OPEN_TRADES_CAP}",
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 9)).pack(side="left", padx=(6, 0))
+                  foreground="#a0aab2", background="#111214",
+                  font=(FONT, 9)).pack(side="left", padx=(6, 0))
         self._tip(max_open_label, SETTINGS_HELP["Max open trades"])
         self._tip(max_open_spin, SETTINGS_HELP["Max open trades"])
 
         # Pre-trade wave analysis
         self._s_pretrade_enabled = tk.BooleanVar(value=config.PRE_TRADE_ANALYSIS_ENABLED)
-        pretrade_frame = tk.Frame(grid, bg="#0d1117")
+        pretrade_frame = tk.Frame(grid, bg="#111214")
         pretrade_frame.grid(row=9, column=1, sticky="w", padx=8, pady=4)
-        pretrade_label = ttk.Label(grid, text="Pre-trade wave check", foreground="#8b949e", background="#0d1117",
-                                   font=("Consolas", 9), width=22)
+        pretrade_label = ttk.Label(grid, text="Pre-trade wave check", foreground="#a0aab2", background="#111214",
+                                   font=(FONT, 9), width=22)
         pretrade_label.grid(row=9, column=0, sticky="w", pady=4)
         pretrade_check = ttk.Checkbutton(pretrade_frame, text="Enable", variable=self._s_pretrade_enabled)
         pretrade_check.pack(side="left")
@@ -1339,10 +1329,10 @@ class Dashboard:
             values=("okx", "binance"), state="readonly", style="Settings.TCombobox", width=10), 15)
 
         self._s_auto_start = tk.BooleanVar(value=config.AUTO_START_FUTURES)
-        auto_frame = tk.Frame(grid, bg="#0d1117")
+        auto_frame = tk.Frame(grid, bg="#111214")
         auto_frame.grid(row=13, column=1, sticky="w", padx=8, pady=4)
-        auto_label = ttk.Label(grid, text="Auto-start futures", foreground="#8b949e", background="#0d1117",
-                               font=("Consolas", 9), width=22)
+        auto_label = ttk.Label(grid, text="Auto-start futures", foreground="#a0aab2", background="#111214",
+                               font=(FONT, 9), width=22)
         auto_label.grid(row=13, column=0, sticky="w", pady=4)
         auto_check = ttk.Checkbutton(auto_frame, text="Enable on launch", variable=self._s_auto_start)
         auto_check.pack(side="left")
@@ -1350,10 +1340,10 @@ class Dashboard:
         self._tip(auto_check, SETTINGS_HELP["Auto-start futures"])
 
         self._s_ohverlay_enabled = tk.BooleanVar(value=config.OHVERLAY_ENABLED)
-        ohverlay_frame = tk.Frame(grid, bg="#0d1117")
+        ohverlay_frame = tk.Frame(grid, bg="#111214")
         ohverlay_frame.grid(row=14, column=1, sticky="w", padx=8, pady=4)
-        ohverlay_label = ttk.Label(grid, text="Ohverlay alerts", foreground="#8b949e", background="#0d1117",
-                                   font=("Consolas", 9), width=22)
+        ohverlay_label = ttk.Label(grid, text="Ohverlay alerts", foreground="#a0aab2", background="#111214",
+                                   font=(FONT, 9), width=22)
         ohverlay_label.grid(row=14, column=0, sticky="w", pady=4)
         ohverlay_check = ttk.Checkbutton(ohverlay_frame, text="Enable bubbles", variable=self._s_ohverlay_enabled)
         ohverlay_check.pack(side="left")
@@ -1367,24 +1357,29 @@ class Dashboard:
         # Apply button
         setup_msg = "" if self._settings_confirmed else "First run: review these values, then click Apply Settings."
         self._s_status = tk.StringVar(value=setup_msg)
-        bf = tk.Frame(settings_panel, bg="#0d1117")
+        bf = tk.Frame(settings_panel, bg="#111214")
         bf.pack(fill="x", pady=12)
         apply_settings_btn = ttk.Button(bf, text="Apply Settings", style="Btn.TButton",
                                         command=self._apply_settings)
         apply_settings_btn.pack(side="left")
         self._tip(apply_settings_btn, "Save settings to .env and apply them to new futures trades. Open trades keep original leverage, margin, TP, and SL.")
-        ttk.Label(bf, textvariable=self._s_status, foreground="#3fb950",
-                  background="#0d1117", font=("Consolas", 9), wraplength=510).pack(side="left", padx=12)
+        ttk.Label(bf, textvariable=self._s_status, foreground="#47c997",
+                  background="#111214", font=(FONT, 9), wraplength=510).pack(side="left", padx=12)
 
         ttk.Label(settings_panel,
                   text="Changes apply to new trades only. Open positions keep their original settings.",
-                  foreground="#8b949e", background="#0d1117",
-                  font=("Consolas", 8)).pack(anchor="w")
+                  foreground="#a0aab2", background="#111214",
+                  font=(FONT, 8)).pack(anchor="w")
 
         self._account_summary_var = tk.StringVar(value="")
         ttk.Label(body, textvariable=self._account_summary_var, wraplength=370,
-                  foreground="#58a6ff", background="#0d1117", font=("Consolas", 10),
+                  foreground="#59dcb2", background="#111214", font=(FONT, 10),
                   justify="left").pack(side="left", anchor="n", padx=(20, 0))
+        def attach_wheel(widget):
+            widget.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"), add="+")
+            for child in widget.winfo_children():
+                attach_wheel(child)
+        attach_wheel(body)
 
     def _send_ohverlay_test(self):
         previous = config.OHVERLAY_ENABLED
@@ -1561,7 +1556,7 @@ class Dashboard:
 
     @staticmethod
     def _new_trade_setting_text() -> str:
-        return f"   {config.FUTURES_EXCHANGE.upper()} PAPER {config.LEVERAGE}x / MAX {config.MAX_OPEN_TRADES}"
+        return f"{config.FUTURES_EXCHANGE.upper()} Futures  /  {config.LEVERAGE}x cross  /  Max {config.MAX_OPEN_TRADES}"
 
     @staticmethod
     def _num(value, default: float = 0.0) -> float:
@@ -2152,7 +2147,7 @@ class Dashboard:
                     f"{config.FUTURES_EXCHANGE.upper()} / CROSS\n"
                     f"Exposure cap: {config.FUTURES_MAX_ACCOUNT_LEVERAGE:g}x account\n"
                     f"Cash reserve: {config.FUTURES_CASH_RESERVE_PCT:.0%}\n\n"
-                    f"LUM bridge: {'CONNECTED' if self._bridge else 'OFF'}")
+                    f"LUM bridge: {'READY' if self._bridge else 'OFF'}")
             if hasattr(self, "notebook"):
                 tab = self.notebook.tab(self.notebook.select(), "text").strip()
                 if tab == "Risk":
@@ -2166,6 +2161,8 @@ class Dashboard:
             text=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
 
     def _update_status(self):
+        self.pause_btn.configure(image=self._icons["play" if self._paused else "pause"])
+        self._run_state_var.set("Paused" if self._paused else "Running")
         if not self._settings_confirmed:
             self.status_var.set("First run: review Settings and click Apply Settings before trading.")
             return
@@ -2214,6 +2211,7 @@ class Dashboard:
         self.portfolio_var.set(f"${portfolio:,.2f}")
         self.cash_var.set(f"${cash:,.2f}")
         self.pnl_var.set(f"{pnl_pct:+.2f}%")
+        self._metric_values["Total return"].configure(foreground=SUCCESS if pnl_pct >= 0 else DANGER)
         self.open_var.set(str(len(open_positions)))
         self.trades_var.set(str(stats.get("total_trades", 0)))
         self.winrate_var.set(f"{stats.get('win_rate', 0):.1f}%")
@@ -2230,7 +2228,12 @@ class Dashboard:
         now            = datetime.now(timezone.utc)
         self.trader.refresh_cross_liquidation_prices()
         open_positions = list(self.trader.get_open_positions())  # snapshot — no race condition
-        for pos in open_positions:
+        self._positions_count.set(f"{len(open_positions)} / {config.MAX_OPEN_TRADES}")
+        if open_positions:
+            self._open_empty.place_forget()
+        else:
+            self._open_empty.place(relx=0.5, rely=0.5, anchor="center")
+        for index, pos in enumerate(open_positions):
             age_h   = (now - pos.entry_time).total_seconds() / 3600
             current = pos.last_known_price or pos.entry_price
             pos.tp_price = self.trader._net_tp_price(pos, now)
@@ -2242,16 +2245,16 @@ class Dashboard:
             else:
                 pnl_str = "--"
             risk_price = self._num(getattr(pos, "liquidation_price", 0.0), 0.0)
-            risk_str = f"${risk_price:.4f}" if 0 < risk_price < pos.entry_price else "No near liq"
-            self.pos_tree.insert("", "end", values=(
+            risk_str = self._price_text(risk_price) if 0 < risk_price < pos.entry_price else "No near liq"
+            self.pos_tree.insert("", "end", tags=("odd" if index % 2 else "even",), values=(
                 pos.symbol,
                 f"${pos.amount_usd:.2f}",
                 f"{leverage}x",
-                f"${pos.entry_price:.4f}",
-                f"${current:.4f}" if current else "--",
+                self._price_text(pos.entry_price),
+                self._price_text(current) if current else "--",
                 pnl_str,
                 f"{pos.entry_change_24h:+.2f}%",
-                f"${pos.tp_price:.4f}",
+                self._price_text(pos.tp_price),
                 risk_str,
                 f"{age_h:.1f}h",
             ))
@@ -2260,19 +2263,19 @@ class Dashboard:
         for item in self.closed_tree.get_children():
             self.closed_tree.delete(item)
         closed = list(self.trader.get_trade_history())  # snapshot
-        for pos in reversed(closed[-10:]):
+        for index, pos in enumerate(reversed(closed[-10:])):
             exit_t  = getattr(pos, "exit_time", None)
             t_str   = exit_t.strftime("%m/%d %H:%M") if exit_t else "--"
             reason  = getattr(pos, "status", "--")
             if hasattr(reason, "value"):
                 reason = reason.value
             leverage = getattr(pos, "leverage", 1)
-            self.closed_tree.insert("", "end", values=(
+            self.closed_tree.insert("", "end", tags=("odd" if index % 2 else "even",), values=(
                 pos.symbol,
                 f"${pos.amount_usd:.2f}",
                 f"{leverage}x",
-                f"${pos.entry_price:.4f}",
-                f"${pos.exit_price:.4f}" if pos.exit_price else "--",
+                self._price_text(pos.entry_price),
+                self._price_text(pos.exit_price) if pos.exit_price else "--",
                 f"{pos.pnl_pct:+.2f}%",
                 f"${pos.pnl_usd:+.2f}",
                 f"{pos.entry_change_24h:+.2f}%",

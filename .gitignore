@@ -47,3 +47,7 @@ Thumbs.db
 
 # Local share/export folders
 TradingBot23_for_friend/
+
+# Local UI verification artifacts
+.playwright-cli/
+output/playwright/
